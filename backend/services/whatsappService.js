@@ -24,6 +24,16 @@ function getLatestQR() {
   return latestQR;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function enqueue(task) {
+  const run = checkQueue.then(task, task);
+  checkQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
+
 function clearAuthFolder() {
   try {
     if (fs.existsSync(AUTH_DIR)) {
@@ -129,6 +139,10 @@ function formatPhoneNumber(phoneNumber) {
 }
 
 async function checkNumberStatus(phoneNumber) {
+  return enqueue(() => lookupNumber(phoneNumber));
+}
+
+async function lookupNumber(phoneNumber) {
   if (connectionStatus !== STATUS.CONNECTED || !sock) {
     const error = new Error('WhatsApp is not connected');
     error.statusCode = 503;
@@ -146,6 +160,29 @@ async function checkNumberStatus(phoneNumber) {
   };
 }
 
+async function checkBulkNumbers(numbersArray, delayMs = 1500, onProgress) {
+  if (!Array.isArray(numbersArray)) {
+    const error = new Error('numbersArray must be an array');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const results = [];
+
+  for (let index = 0; index < numbersArray.length; index += 1) {
+    results.push(await checkNumberStatus(numbersArray[index]));
+    if (typeof onProgress === 'function') {
+      onProgress(index + 1, numbersArray.length);
+    }
+
+    if (index < numbersArray.length - 1) {
+      await sleep(delayMs);
+    }
+  }
+
+  return results;
+}
+
 module.exports = {
   STATUS,
   getConnectionStatus,
@@ -153,4 +190,5 @@ module.exports = {
   connectWhatsApp,
   formatPhoneNumber,
   checkNumberStatus,
+  checkBulkNumbers,
 };
