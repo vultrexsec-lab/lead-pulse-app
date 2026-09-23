@@ -6,7 +6,11 @@ const cors = require('cors');
 const multer = require('multer');
 
 let QRCode;
-try { QRCode = require('qrcode'); } catch (e) { QRCode = null; }
+try {
+  QRCode = require('qrcode');
+} catch (e) {
+  QRCode = null;
+}
 
 const apiRoutes = require('./routes');
 const whatsappRoutes = require('./routes/whatsappRoutes');
@@ -22,7 +26,7 @@ fs.mkdirSync(uploadsDir, { recursive: true });
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, uploadsDir),
-  filename: (_req, file, cb) => cb(null, `\({Date.now()}-\){file.originalname.replace(/[^\w.\-]+/g, '_')}`)
+  filename: (_req, file, cb) => cb(null, Date.now() + '-' + file.originalname.replace(/[^\w.\-]+/g, '_'))
 });
 
 const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
