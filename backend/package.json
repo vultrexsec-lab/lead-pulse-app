@@ -1,0 +1,23 @@
+{
+  "name": "lead-extractor-backend",
+  "version": "1.0.0",
+  "description": "Lead Extractor & WhatsApp Validator API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.18",
+    "axios": "^1.11.0",
+    "cheerio": "^1.1.2",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "exceljs": "^4.4.0",
+    "express": "^5.1.0",
+    "multer": "^2.0.2",
+    "pino": "^9.6.0",
+    "puppeteer": "^24.19.0",
+    "qrcode-terminal": "^0.12.0",
+    "xlsx": "^0.18.5"
+  }
+}
