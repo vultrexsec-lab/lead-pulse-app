@@ -49,48 +49,4 @@ const handleQR = async function (req, res) {
   const status = typeof whatsappService.getConnectionStatus === 'function' ? whatsappService.getConnectionStatus() : '';
 
   if (status === 'CONNECTED') {
-    return res.status(200).json({ status: 'connected', message: 'WhatsApp is already connected.' });
-  }
-
-  if (!qr) {
-    return res.status(200).json({ status: 'generating', message: 'QR code is generating, please retry in 3 seconds.' });
-  }
-
-  if (!QRCode) {
-    return res.status(500).json({ status: 'error', message: 'QRCode library missing.' });
-  }
-
-  try {
-    const qrDataUrl = await QRCode.toDataURL(qr);
-    return res.status(200).json({ status: 'qr_ready', qr: qrDataUrl });
-  } catch (e) {
-    return res.status(500).json({ status: 'error', message: 'Error rendering QR Code' });
-  }
-};
-
-app.get('/qr', handleQR);
-app.get('/api/qr', handleQR);
-
-app.use('/api/whatsapp', whatsappRoutes);
-app.use('/api/scraper', scraperRoutes);
-app.use('/api/process', processRoutes);
-app.use('/api', apiRoutes);
-
-app.use(function (err, _req, res, _next) {
-  if (err instanceof multer.MulterError) {
-    return res.status(400).json({ status: 'error', message: err.message });
-  }
-  console.error(err);
-  return res.status(500).json({ status: 'error', message: 'Internal server error' });
-});
-
-app.listen(PORT, function () {
-  console.log('Backend running on port ' + PORT);
-  if (typeof whatsappService.connectWhatsApp === 'function') {
-    whatsappService.connectWhatsApp().catch(function (err) {
-      console.error('WhatsApp err:', err.message);
-    });
-  }
-});
-
-module.exports = { app: app, upload: upload };
+    return res.status(200).send('
