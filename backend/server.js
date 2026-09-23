@@ -5,13 +5,19 @@ const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const QRCode = require('qrcode');
+
+let QRCode;
+try {
+  QRCode = require('qrcode');
+} catch (e) {
+  QRCode = null;
+}
 
 const apiRoutes = require('./routes');
 const whatsappRoutes = require('./routes/whatsappRoutes');
 const scraperRoutes = require('./routes/scraperRoutes');
 const processRoutes = require('./routes/processRoutes');
-const { connectWhatsApp, getLatestQR, getConnectionStatus } = require('./services/whatsappService');
+const whatsappService = require('./services/whatsappService');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -39,10 +45,10 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.set('upload', upload);
 
-// Web QR Code Route for direct browser scanning
+// Web QR Route
 app.get('/qr', async (req, res) => {
-  const qr = getLatestQR ? getLatestQR() : '';
-  const status = getConnectionStatus ? getConnectionStatus() : '';
+  const qr = typeof whatsappService.getLatestQR === 'function' ? whatsappService.getLatestQR() : '';
+  const status = typeof whatsappService.getConnectionStatus === 'function' ? whatsappService.getConnectionStatus() : '';
 
   if (status === 'CONNECTED') {
     return res.send(`
