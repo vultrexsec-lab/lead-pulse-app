@@ -1,7 +1,6 @@
 const fs = require('fs');
 const path = require('path');
 const pino = require('pino');
-const qrcode = require('qrcode-terminal');
 
 const AUTH_DIR = path.join(__dirname, '..', 'auth_info_baileys');
 
@@ -25,60 +24,20 @@ function getLatestQR() {
   return latestQR;
 }
 
-function formatPhoneNumber(phoneNumber) {
-  let digits = String(phoneNumber ?? '').replace(/\D/g, '');
-
-  if (digits.length === 11 && digits.startsWith('0')) {
-    digits = digits.slice(1);
-  }
-
-  if (digits.length === 10) {
-    digits = `91${digits}`;
-  }
-
-  if (!digits) {
-    const error = new Error('A valid phone number is required');
-    error.statusCode = 400;
-    throw error;
-  }
-
-  return digits;
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
-
-function enqueue(task) {
-  const run = checkQueue.then(task, task);
-  checkQueue = run.then(
-    () => undefined,
-    () => undefined
-  );
-  return run;
-}
-
 function clearAuthFolder() {
   try {
     if (fs.existsSync(AUTH_DIR)) {
       fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-      console.log('Cleared corrupted/old auth session folder.');
+      console.log('Cleared session directory');
     }
   } catch (err) {
-    console.error('Error clearing auth directory:', err.message);
+    console.error('Auth dir cleanup error:', err.message);
   }
 }
 
 async function connectWhatsApp() {
-  if (connectionStatus === STATUS.CONNECTED && sock) {
-    return;
-  }
-
-  if (connectPromise) {
-    return connectPromise;
-  }
+  if (connectionStatus === STATUS.CONNECTED && sock) return;
+  if (connectPromise) return connectPromise;
 
   connectPromise = openSocket().finally(() => {
     connectPromise = null;
@@ -98,14 +57,16 @@ async function openSocket() {
   fs.mkdirSync(AUTH_DIR, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  
+
   const socketConfig = {
     auth: state,
     logger: pino({ level: 'silent' }),
-    browser: ['Lead Pulse App', 'Chrome', '1.0.0'],
+    browser: ['Ubuntu', 'Chrome', '110.0.5563.146'],
     syncFullHistory: false,
+    markOnlineOnConnect: false,
     connectTimeoutMs: 60000,
-    qrTimeout: 40000
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 25000,
   };
 
   try {
@@ -126,14 +87,13 @@ async function openSocket() {
     if (qr) {
       latestQR = qr;
       connectionStatus = STATUS.NEED_QR;
-      console.log('WhatsApp authentication required. Scan QR code:');
-      qrcode.generate(qr, { small: true });
+      console.log('New WhatsApp QR code generated.');
     }
 
     if (connection === 'open') {
       latestQR = '';
       connectionStatus = STATUS.CONNECTED;
-      console.log('WhatsApp connected successfully');
+      console.log('WhatsApp connected successfully!');
     }
 
     if (connection === 'close') {
@@ -142,29 +102,33 @@ async function openSocket() {
       sock = null;
 
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const loggedOut = statusCode === DisconnectReason.loggedOut;
-      console.log(`WhatsApp disconnected (${statusCode ?? 'unknown'})`);
+      console.log(`WhatsApp disconnected with status code: ${statusCode}`);
 
-      if (loggedOut) {
-        console.log('Session logged out. Clearing auth directory...');
+      if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403) {
+        console.log('Invalid session, clearing auth folder...');
         clearAuthFolder();
-        connectWhatsApp().catch((error) => {
-          console.error('WhatsApp reconnect after logout failed:', error.message);
-        });
-      } else {
-        connectWhatsApp().catch((error) => {
-          console.error('WhatsApp reconnect failed:', error.message);
-        });
       }
+
+      setTimeout(() => {
+        connectWhatsApp().catch((err) => console.error('Reconnect failed:', err.message));
+      }, 3000);
     }
   });
 }
 
-async function checkNumberStatus(phoneNumber) {
-  return enqueue(() => lookupNumber(phoneNumber));
+function formatPhoneNumber(phoneNumber) {
+  let digits = String(phoneNumber ?? '').replace(/\D/g, '');
+  if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
+  if (digits.length === 10) digits = `91${digits}`;
+  if (!digits) {
+    const error = new Error('Valid phone number required');
+    error.statusCode = 400;
+    throw error;
+  }
+  return digits;
 }
 
-async function lookupNumber(phoneNumber) {
+async function checkNumberStatus(phoneNumber) {
   if (connectionStatus !== STATUS.CONNECTED || !sock) {
     const error = new Error('WhatsApp is not connected');
     error.statusCode = 503;
@@ -182,29 +146,6 @@ async function lookupNumber(phoneNumber) {
   };
 }
 
-async function checkBulkNumbers(numbersArray, delayMs = 1500, onProgress) {
-  if (!Array.isArray(numbersArray)) {
-    const error = new Error('numbersArray must be an array');
-    error.statusCode = 400;
-    throw error;
-  }
-
-  const results = [];
-
-  for (let index = 0; index < numbersArray.length; index += 1) {
-    results.push(await checkNumberStatus(numbersArray[index]));
-    if (typeof onProgress === 'function') {
-      onProgress(index + 1, numbersArray.length);
-    }
-
-    if (index < numbersArray.length - 1) {
-      await sleep(delayMs);
-    }
-  }
-
-  return results;
-}
-
 module.exports = {
   STATUS,
   getConnectionStatus,
@@ -212,5 +153,4 @@ module.exports = {
   connectWhatsApp,
   formatPhoneNumber,
   checkNumberStatus,
-  checkBulkNumbers,
 };
