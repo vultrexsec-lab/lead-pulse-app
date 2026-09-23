@@ -45,8 +45,8 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.set('upload', upload);
 
-// Web QR Route
-app.get('/qr', async (req, res) => {
+// Helper Handler for QR Code Rendering
+const handleQRRequest = async (req, res) => {
   const qr = typeof whatsappService.getLatestQR === 'function' ? whatsappService.getLatestQR() : '';
   const status = typeof whatsappService.getConnectionStatus === 'function' ? whatsappService.getConnectionStatus() : '';
 
