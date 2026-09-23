@@ -60,6 +60,17 @@ function enqueue(task) {
   return run;
 }
 
+function clearAuthFolder() {
+  try {
+    if (fs.existsSync(AUTH_DIR)) {
+      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+      console.log('Cleared corrupted/old auth session folder.');
+    }
+  } catch (err) {
+    console.error('Error clearing auth directory:', err.message);
+  }
+}
+
 async function connectWhatsApp() {
   if (connectionStatus === STATUS.CONNECTED && sock) {
     return;
@@ -87,36 +98,42 @@ async function openSocket() {
   fs.mkdirSync(AUTH_DIR, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  
   const socketConfig = {
     auth: state,
     logger: pino({ level: 'silent' }),
+    browser: ['Lead Pulse App', 'Chrome', '1.0.0'],
+    syncFullHistory: false,
+    connectTimeoutMs: 60000,
+    qrTimeout: 40000
   };
 
   try {
     const { version } = await fetchLatestBaileysVersion();
     socketConfig.version = version;
   } catch (error) {
-    console.warn('Using the bundled Baileys version:', error.message);
+    console.warn('Using bundled Baileys version:', error.message);
   }
 
   const socket = makeWASocket(socketConfig);
   sock = socket;
 
   socket.ev.on('creds.update', saveCreds);
+
   socket.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
       latestQR = qr;
       connectionStatus = STATUS.NEED_QR;
-      console.log('WhatsApp authentication required. Scan QR code in browser or terminal:');
+      console.log('WhatsApp authentication required. Scan QR code:');
       qrcode.generate(qr, { small: true });
     }
 
     if (connection === 'open') {
       latestQR = '';
       connectionStatus = STATUS.CONNECTED;
-      console.log('WhatsApp connected');
+      console.log('WhatsApp connected successfully');
     }
 
     if (connection === 'close') {
@@ -128,7 +145,13 @@ async function openSocket() {
       const loggedOut = statusCode === DisconnectReason.loggedOut;
       console.log(`WhatsApp disconnected (${statusCode ?? 'unknown'})`);
 
-      if (!loggedOut) {
+      if (loggedOut) {
+        console.log('Session logged out. Clearing auth directory...');
+        clearAuthFolder();
+        connectWhatsApp().catch((error) => {
+          console.error('WhatsApp reconnect after logout failed:', error.message);
+        });
+      } else {
         connectWhatsApp().catch((error) => {
           console.error('WhatsApp reconnect failed:', error.message);
         });
