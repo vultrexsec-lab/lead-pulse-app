@@ -15,7 +15,7 @@ let sock = null;
 let connectionStatus = STATUS.DISCONNECTED;
 let connectPromise = null;
 let checkQueue = Promise.resolve();
-let latestQR = ''; // Stores the raw QR string for Web UI display
+let latestQR = '';
 
 function getConnectionStatus() {
   return connectionStatus;
@@ -107,14 +107,14 @@ async function openSocket() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      latestQR = qr; // Save raw QR code string
+      latestQR = qr;
       connectionStatus = STATUS.NEED_QR;
       console.log('WhatsApp authentication required. Scan QR code in browser or terminal:');
       qrcode.generate(qr, { small: true });
     }
 
     if (connection === 'open') {
-      latestQR = ''; // Clear QR on successful login
+      latestQR = '';
       connectionStatus = STATUS.CONNECTED;
       console.log('WhatsApp connected');
     }
