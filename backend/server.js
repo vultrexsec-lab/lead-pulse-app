@@ -49,4 +49,40 @@ const handleQR = async function (req, res) {
   const status = typeof whatsappService.getConnectionStatus === 'function' ? whatsappService.getConnectionStatus() : '';
 
   if (status === 'CONNECTED') {
-    return res.status(200).send('
+    return res.status(200).json({ status: 'connected', message: 'WhatsApp Connected' });
+  }
+
+  if (!qr) {
+    return res.status(200).json({ status: 'generating', message: 'Generating QR, refresh in 3s' });
+  }
+
+  const qrImageUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=' + encodeURIComponent(qr);
+  return res.redirect(qrImageUrl);
+};
+
+app.get('/qr', handleQR);
+app.get('/api/qr', handleQR);
+
+app.use('/api/whatsapp', whatsappRoutes);
+app.use('/api/scraper', scraperRoutes);
+app.use('/api/process', processRoutes);
+app.use('/api', apiRoutes);
+
+app.use(function (err, _req, res, _next) {
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({ status: 'error', message: err.message });
+  }
+  console.error(err);
+  return res.status(500).json({ status: 'error', message: 'Internal server error' });
+});
+
+app.listen(PORT, function () {
+  console.log('Backend running on port ' + PORT);
+  if (typeof whatsappService.connectWhatsApp === 'function') {
+    whatsappService.connectWhatsApp().catch(function (err) {
+      console.error('WhatsApp err:', err.message);
+    });
+  }
+});
+
+module.exports = { app: app, upload: upload };
