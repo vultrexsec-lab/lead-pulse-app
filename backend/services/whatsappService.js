@@ -15,9 +15,14 @@ let sock = null;
 let connectionStatus = STATUS.DISCONNECTED;
 let connectPromise = null;
 let checkQueue = Promise.resolve();
+let latestQR = ''; // Stores the raw QR string for Web UI display
 
 function getConnectionStatus() {
   return connectionStatus;
+}
+
+function getLatestQR() {
+  return latestQR;
 }
 
 function formatPhoneNumber(phoneNumber) {
@@ -102,17 +107,20 @@ async function openSocket() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      latestQR = qr; // Save raw QR code string
       connectionStatus = STATUS.NEED_QR;
-      console.log('WhatsApp authentication required. Scan this QR code:');
+      console.log('WhatsApp authentication required. Scan QR code in browser or terminal:');
       qrcode.generate(qr, { small: true });
     }
 
     if (connection === 'open') {
+      latestQR = ''; // Clear QR on successful login
       connectionStatus = STATUS.CONNECTED;
       console.log('WhatsApp connected');
     }
 
     if (connection === 'close') {
+      latestQR = '';
       connectionStatus = STATUS.DISCONNECTED;
       sock = null;
 
@@ -177,6 +185,7 @@ async function checkBulkNumbers(numbersArray, delayMs = 1500, onProgress) {
 module.exports = {
   STATUS,
   getConnectionStatus,
+  getLatestQR,
   connectWhatsApp,
   formatPhoneNumber,
   checkNumberStatus,
