@@ -5,12 +5,13 @@ const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
+const QRCode = require('qrcode');
 
 const apiRoutes = require('./routes');
 const whatsappRoutes = require('./routes/whatsappRoutes');
 const scraperRoutes = require('./routes/scraperRoutes');
 const processRoutes = require('./routes/processRoutes');
-const { connectWhatsApp } = require('./services/whatsappService');
+const { connectWhatsApp, getLatestQR, getConnectionStatus } = require('./services/whatsappService');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -24,7 +25,7 @@ const storage = multer.diskStorage({
   },
   filename: (_req, file, cb) => {
     const safeName = file.originalname.replace(/[^\w.\-]+/g, '_');
-    cb(null, `${Date.now()}-${safeName}`);
+    cb(null, `\({Date.now()}-\){safeName}`);
   },
 });
 
@@ -38,25 +39,10 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.set('upload', upload);
 
-app.use('/api/whatsapp', whatsappRoutes);
-app.use('/api/scraper', scraperRoutes);
-app.use('/api/process', processRoutes);
-app.use('/api', apiRoutes);
+// Web QR Code Route for direct browser scanning
+app.get('/qr', async (req, res) => {
+  const qr = getLatestQR ? getLatestQR() : '';
+  const status = getConnectionStatus ? getConnectionStatus() : '';
 
-app.use((err, _req, res, _next) => {
-  if (err instanceof multer.MulterError) {
-    return res.status(400).json({ status: 'error', message: err.message });
-  }
-
-  console.error(err);
-  return res.status(500).json({ status: 'error', message: 'Internal server error' });
-});
-
-app.listen(PORT, () => {
-  console.log(`Backend running on http://localhost:${PORT}`);
-  connectWhatsApp().catch((error) => {
-    console.error('Failed to start WhatsApp connection:', error.message);
-  });
-});
-
-module.exports = { app, upload };
+  if (status === 'CONNECTED') {
+    return res.send(`
