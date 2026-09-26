@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "postinstall": "node scripts/patch-baileys-pairing.js && npx puppeteer browsers install chrome || true",
+    "postinstall": "node scripts/patch-baileys-pairing.js",
     "patch:baileys": "node scripts/patch-baileys-pairing.js"
   },
   "dependencies": {

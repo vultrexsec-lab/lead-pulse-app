@@ -1,5 +1,5 @@
 /**
- * Patches baileys@7.0.0-rc14 for WhatsApp companion_reg_refresh pairing.
+ * Patches baileys@7 for WhatsApp companion_reg_refresh pairing.
  * Without this, phones show: "Couldn't link device".
  * Based on WhiskeySockets/Baileys#2765
  */
@@ -17,6 +17,16 @@ function findBaileysRoot() {
   return null;
 }
 
+function isPatched(root) {
+  try {
+    const socket = fs.readFileSync(path.join(root, 'lib', 'Socket', 'socket.js'), 'utf8');
+    const utils = fs.readFileSync(path.join(root, 'lib', 'Utils', 'companion-reg-client-utils.js'), 'utf8');
+    return socket.includes('companion_reg_refresh') && utils.includes('handleCompanionRegRefresh');
+  } catch {
+    return false;
+  }
+}
+
 function patchUtils(root) {
   const file = path.join(root, 'lib', 'Utils', 'companion-reg-client-utils.js');
   if (!fs.existsSync(file)) {
@@ -29,20 +39,11 @@ function patchUtils(root) {
     return true;
   }
 
-  // Ensure crypto import
   if (!src.includes("from 'crypto'") && !src.includes('from "crypto"')) {
     src = `import { randomBytes } from 'crypto';\n` + src;
   }
-
-  // Need getBinaryNodeChild - import from WABinary if not present
   if (!src.includes('getBinaryNodeChild')) {
-    src = src.replace(
-      /import \{ randomBytes \} from 'crypto';/,
-      `import { randomBytes } from 'crypto';\nimport { getBinaryNodeChild } from '../WABinary/index.js';`
-    );
-    if (!src.includes('getBinaryNodeChild')) {
-      src = `import { getBinaryNodeChild } from '../WABinary/index.js';\n` + src;
-    }
+    src = `import { getBinaryNodeChild } from '../WABinary/index.js';\n` + src;
   }
 
   const addition = `
@@ -103,7 +104,6 @@ function patchSocket(root) {
     return true;
   }
 
-  // Expand import from Utils
   if (!src.includes('handleCompanionRegRefresh')) {
     src = src.replace(
       'buildPairingQRData,',
@@ -191,21 +191,15 @@ function patchSocket(root) {
         });
     });`;
 
-  if (!src.includes(oldBlock)) {
-    // try looser match
-    if (!src.includes("ws.on('CB:iq,type:set,pair-device'")) {
+  if (src.includes(oldBlock)) {
+    src = src.replace(oldBlock, newBlock);
+  } else {
+    const re = /\/\/ QR gen\n\s*ws\.on\('CB:iq,type:set,pair-device', async \(stanza\) => \{[\s\S]*?genPairQR\(\);\n\s*\}\);/;
+    if (!re.test(src)) {
       console.error('[patch-baileys] pair-device handler not found — baileys version mismatch');
       return false;
     }
-    console.warn('[patch-baileys] exact block mismatch, trying regex replace');
-    const re = /\/\/ QR gen\n\s*ws\.on\('CB:iq,type:set,pair-device', async \(stanza\) => \{[\s\S]*?genPairQR\(\);\n\s*\}\);/;
-    if (!re.test(src)) {
-      console.error('[patch-baileys] regex failed — cannot patch socket.js');
-      return false;
-    }
     src = src.replace(re, newBlock);
-  } else {
-    src = src.replace(oldBlock, newBlock);
   }
 
   fs.writeFileSync(file, src);
@@ -213,20 +207,26 @@ function patchSocket(root) {
   return true;
 }
 
-function main() {
+function ensurePatched() {
   const root = findBaileysRoot();
   if (!root) {
     console.warn('[patch-baileys] baileys not installed — skip');
-    process.exit(0);
+    return false;
+  }
+  if (isPatched(root)) {
+    console.log('[patch-baileys] already OK:', root);
+    return true;
   }
   console.log('[patch-baileys] patching', root);
   const ok1 = patchUtils(root);
   const ok2 = patchSocket(root);
-  if (!ok1 || !ok2) {
-    console.error('[patch-baileys] FAILED — QR linking may still break');
-    process.exit(0); // don't fail install
-  }
-  console.log('[patch-baileys] OK — companion_reg_refresh enabled');
+  const done = ok1 && ok2 && isPatched(root);
+  console.log(done ? '[patch-baileys] OK — companion_reg_refresh enabled' : '[patch-baileys] FAILED');
+  return done;
 }
 
-main();
+if (require.main === module) {
+  ensurePatched();
+}
+
+module.exports = { ensurePatched, isPatched, findBaileysRoot };

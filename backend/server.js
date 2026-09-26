@@ -17,6 +17,11 @@ const whatsappRoutes = require('./routes/whatsappRoutes');
 const scraperRoutes = require('./routes/scraperRoutes');
 const processRoutes = require('./routes/processRoutes');
 const whatsappService = require('./services/whatsappService');
+try {
+  require('./scripts/patch-baileys-pairing').ensurePatched();
+} catch (e) {
+  console.warn('[wa] patch ensure failed:', e.message);
+}
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -54,6 +59,17 @@ const handleQR = async function (req, res) {
   const qr = typeof whatsappService.getLatestQR === 'function' ? whatsappService.getLatestQR() : '';
   const status = typeof whatsappService.getConnectionStatus === 'function' ? whatsappService.getConnectionStatus() : '';
 
+  // JSON debug: /qr?format=json or /api/qr?format=json
+  if (req.query && req.query.format === 'json') {
+    return res.status(200).json({
+      status: status,
+      hasQr: Boolean(qr),
+      qrPreview: qr ? String(qr).slice(0, 80) : null,
+      qrLength: qr ? String(qr).length : 0,
+      qrStartsWithWaMe: qr ? String(qr).startsWith('https://wa.me/') : false,
+    });
+  }
+
   if (status === 'CONNECTED') {
     return res.status(200).json({ status: 'connected', message: 'WhatsApp Connected' });
   }
@@ -62,22 +78,29 @@ const handleQR = async function (req, res) {
     return res.status(200).json({ status: 'generating', message: 'Generating QR, refresh in 3s' });
   }
 
-  // Prefer local QR image if qrcode package is available (more reliable than third-party redirect)
+  // Always prefer local PNG — third-party QR APIs can corrupt long Baileys payloads
   if (QRCode) {
     try {
-      const png = await QRCode.toBuffer(qr, { type: 'png', width: 320, margin: 2, errorCorrectionLevel: 'M' });
+      const png = await QRCode.toBuffer(String(qr), {
+        type: 'png',
+        width: 400,
+        margin: 2,
+        errorCorrectionLevel: 'L',
+      });
       res.setHeader('Content-Type', 'image/png');
-      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+      res.setHeader('Pragma', 'no-cache');
       return res.status(200).send(png);
     } catch (e) {
       console.warn('Local QR render failed:', e.message);
     }
   }
 
-  const qrImageUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=320x320&margin=10&data=' + encodeURIComponent(qr);
+  const qrImageUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=400x400&ecc=L&data=' + encodeURIComponent(String(qr));
   res.setHeader('Cache-Control', 'no-store');
   return res.redirect(qrImageUrl);
 };
+
 
 app.get('/qr', handleQR);
 app.get('/api/qr', handleQR);

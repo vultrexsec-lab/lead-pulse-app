@@ -220,7 +220,14 @@ async function openBaileys() {
     if (qr) {
       latestQR = qr;
       connectionStatus = STATUS.NEED_QR;
-      console.log('[wa] QR ready → open /qr and scan within 60s');
+      const s = String(qr);
+      console.log(
+        '[wa] QR ready len=%s startsWithWaMe=%s preview=%s',
+        s.length,
+        s.startsWith('https://wa.me/'),
+        s.slice(0, 60)
+      );
+      console.log('[wa] Open /qr (hard refresh) and scan within 60s');
     }
 
     if (isNewLogin) console.log('[wa] isNewLogin');
