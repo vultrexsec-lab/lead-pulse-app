@@ -5,14 +5,14 @@ const puppeteer = require('puppeteer');
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
-// Limits for directory / listing crawls (safety + practical runtime)
-// Keep defaults small so UI does not hang for 10+ minutes; raise via env for bulk jobs.
-const MAX_LISTING_PAGES = Number(process.env.MAX_LISTING_PAGES || 15);
-const MAX_PROFILE_PAGES = Number(process.env.MAX_PROFILE_PAGES || 300);
-const PROFILE_CONCURRENCY = Number(process.env.PROFILE_CONCURRENCY || 10);
-const REQUEST_DELAY_MS = Number(process.env.SCRAPE_DELAY_MS || 80);
-// When URL already has ?page=N, only that page is scraped (fast). Set FULL_DIRECTORY=1 to crawl many pages.
-const FULL_DIRECTORY = String(process.env.FULL_DIRECTORY || '').trim() === '1';
+// Limits for directory / listing crawls
+// Defaults sized for large white-pages jobs (~12k profiles). Override via env if needed.
+const MAX_LISTING_PAGES = Number(process.env.MAX_LISTING_PAGES || 600);
+const MAX_PROFILE_PAGES = Number(process.env.MAX_PROFILE_PAGES || 12000);
+const PROFILE_CONCURRENCY = Number(process.env.PROFILE_CONCURRENCY || 12);
+const REQUEST_DELAY_MS = Number(process.env.SCRAPE_DELAY_MS || 50);
+// SINGLE_PAGE=1 → only the page in the URL (fast test). Default is full multi-page crawl.
+const SINGLE_PAGE_ONLY = String(process.env.SINGLE_PAGE || '').trim() === '1';
 
 const INTERNAL_LINK_PATTERNS = [
   /\/contact(?:-us|us)?(?:\/|$|\.)/i,
@@ -231,9 +231,13 @@ function normalizePhone(raw, defaultCountryCode = null) {
 
   // Local number — apply default country code when known
   if (defaultCountryCode && !digits.startsWith(defaultCountryCode)) {
-    // Greece: 10-digit mobiles 69... or landlines 2...
-    if (defaultCountryCode === '30' && digits.length === 10 && /^(69|2)\d{8}$/.test(digits)) {
+    // Greece: 10-digit mobiles 69... or landlines 21/22/23... (not random 10-digit IDs)
+    if (defaultCountryCode === '30' && digits.length === 10 && /^(69\d{8}|2[1-9]\d{7})$/.test(digits)) {
       return `30${digits}`;
+    }
+    // Reject other 10-digit junk on Greek pages (tax IDs, postal-like, etc.)
+    if (defaultCountryCode === '30' && digits.length === 10) {
+      return null;
     }
     // India: 10-digit starting 6-9
     if (defaultCountryCode === '91' && digits.length === 10 && /^[6-9]/.test(digits)) {
@@ -592,19 +596,19 @@ function buildListingPageUrls(html, pageUrl) {
     }
   });
 
-  // Fast path: user gave a specific page= URL and FULL_DIRECTORY is off → only that page
-  if (hasExplicitPage && !FULL_DIRECTORY) {
+  // SINGLE_PAGE=1 → only the requested page (quick test)
+  if (SINGLE_PAGE_ONLY) {
     const u = new URL(pageUrl);
     u.searchParams.set('page', String(startPage));
     return { pageUrls: [u.href], maxPage: startPage, catalogLast, singlePage: true };
   }
 
-  // Crawl a window of pages starting at startPage (not from 1..11953)
+  // Full crawl: from startPage forward up to MAX_LISTING_PAGES (or catalog end)
   const count = Math.max(1, MAX_LISTING_PAGES);
   const pageUrls = [];
   for (let i = 0; i < count; i += 1) {
     const p = startPage + i;
-    if (p > catalogLast && catalogLast > startPage) break;
+    if (catalogLast > 0 && p > catalogLast) break;
     const u = new URL(pageUrl);
     u.searchParams.set('page', String(p));
     pageUrls.push(u.href);
@@ -627,14 +631,15 @@ function looksLikeScriptShell(html) {
 
 async function fetchWithAxios(url) {
   const response = await axios.get(url, {
-    timeout: 20000,
+    timeout: 15000,
     maxRedirects: 5,
     maxContentLength: 4 * 1024 * 1024,
     responseType: 'text',
     headers: {
       'User-Agent': USER_AGENT,
       Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en,el;q=0.9',
+      'Accept-Language': 'el,en-US,en;q=0.9',
+      Referer: 'https://www.11888.gr/',
     },
     validateStatus: (status) => status >= 200 && status < 400,
   });
