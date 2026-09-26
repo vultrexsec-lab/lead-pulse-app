@@ -338,12 +338,18 @@ async function processExcelFile(filePath, onProgress = () => {}) {
 
 async function processUrlScrape(url, onProgress = () => {}) {
   onProgress({ percent: 4, message: 'Scraping website pages...' });
-  const leads = await scrapeUrl(url);
+  const leads = await scrapeUrl(url, onProgress);
   const normalized = leads.map((lead) => ({
     name: lead.name,
     number: lead.number,
     source: lead.sourceUrl || url,
   }));
+  if (!normalized.length) {
+    onProgress({ percent: 100, message: 'No phone numbers found on this URL' });
+    const file = await generateExcel([], `url-leads-${Date.now()}.xlsx`);
+    return summarize([], file, 0);
+  }
+  onProgress({ percent: 84, message: `Scraped ${normalized.length} numbers. Verifying WhatsApp...` });
   const { rows, duplicatesRemoved } = await enrichWithWhatsApp(normalized, onProgress);
   onProgress({ percent: 96, message: 'Building Excel sheet...' });
   const file = await generateExcel(rows, `url-leads-${Date.now()}.xlsx`);

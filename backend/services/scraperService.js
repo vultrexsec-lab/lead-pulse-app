@@ -6,10 +6,13 @@ const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
 // Limits for directory / listing crawls (safety + practical runtime)
-const MAX_LISTING_PAGES = Number(process.env.MAX_LISTING_PAGES || 600);
-const MAX_PROFILE_PAGES = Number(process.env.MAX_PROFILE_PAGES || 12000);
-const PROFILE_CONCURRENCY = Number(process.env.PROFILE_CONCURRENCY || 8);
-const REQUEST_DELAY_MS = Number(process.env.SCRAPE_DELAY_MS || 120);
+// Keep defaults small so UI does not hang for 10+ minutes; raise via env for bulk jobs.
+const MAX_LISTING_PAGES = Number(process.env.MAX_LISTING_PAGES || 15);
+const MAX_PROFILE_PAGES = Number(process.env.MAX_PROFILE_PAGES || 300);
+const PROFILE_CONCURRENCY = Number(process.env.PROFILE_CONCURRENCY || 10);
+const REQUEST_DELAY_MS = Number(process.env.SCRAPE_DELAY_MS || 80);
+// When URL already has ?page=N, only that page is scraped (fast). Set FULL_DIRECTORY=1 to crawl many pages.
+const FULL_DIRECTORY = String(process.env.FULL_DIRECTORY || '').trim() === '1';
 
 const INTERNAL_LINK_PATTERNS = [
   /\/contact(?:-us|us)?(?:\/|$|\.)/i,
@@ -566,49 +569,53 @@ function extractProfileLinks(html, pageUrl) {
  * Discover max page number and build page URLs for listing.
  */
 function buildListingPageUrls(html, pageUrl) {
-  const parsed = new URL(pageUrl);
-  const pages = new Set([parsed.href]);
+  const start = new URL(pageUrl);
+  const hasExplicitPage = start.searchParams.has('page');
+  const startPage = Math.max(1, parseInt(start.searchParams.get('page') || '1', 10) || 1);
 
-  // Ensure page=1 base
-  const base = new URL(pageUrl);
-  if (!base.searchParams.has('page')) {
-    base.searchParams.set('page', '1');
-  }
-  pages.add(base.href);
-
-  let maxPage = 1;
-
-  // hx-get="/white-pages/?query=maria&page=11953"
-  const hxPages = String(html || '').matchAll(/[?&]page=(\d+)/gi);
-  for (const match of hxPages) {
+  // Discover catalog last page (for logging only)
+  let catalogLast = startPage;
+  for (const match of String(html || '').matchAll(/[?&]page=(\d+)/gi)) {
     const n = parseInt(match[1], 10);
-    if (Number.isFinite(n) && n > maxPage) maxPage = n;
+    if (Number.isFinite(n) && n > catalogLast) catalogLast = n;
   }
-
-  // pagination buttons text
   const $ = cheerio.load(html || '');
   $('button.paginator-btn, .pagination a, .paginator a, a[href*="page="]').each((_, el) => {
-    const text = cleanText($(el).text());
-    const n = parseInt(text, 10);
-    if (Number.isFinite(n) && n > maxPage) maxPage = n;
+    const label = cleanText($(el).text());
+    const n = parseInt(label, 10);
+    if (Number.isFinite(n) && n > catalogLast) catalogLast = n;
     const href = $(el).attr('href') || $(el).attr('hx-get') || '';
     const pm = href.match(/[?&]page=(\d+)/i);
     if (pm) {
       const pn = parseInt(pm[1], 10);
-      if (Number.isFinite(pn) && pn > maxPage) maxPage = pn;
+      if (Number.isFinite(pn) && pn > catalogLast) catalogLast = pn;
     }
   });
 
-  // Cap pages
-  maxPage = Math.min(maxPage, MAX_LISTING_PAGES);
-
-  for (let p = 1; p <= maxPage; p += 1) {
+  // Fast path: user gave a specific page= URL and FULL_DIRECTORY is off → only that page
+  if (hasExplicitPage && !FULL_DIRECTORY) {
     const u = new URL(pageUrl);
-    u.searchParams.set('page', String(p));
-    pages.add(u.href);
+    u.searchParams.set('page', String(startPage));
+    return { pageUrls: [u.href], maxPage: startPage, catalogLast, singlePage: true };
   }
 
-  return { pageUrls: [...pages], maxPage };
+  // Crawl a window of pages starting at startPage (not from 1..11953)
+  const count = Math.max(1, MAX_LISTING_PAGES);
+  const pageUrls = [];
+  for (let i = 0; i < count; i += 1) {
+    const p = startPage + i;
+    if (p > catalogLast && catalogLast > startPage) break;
+    const u = new URL(pageUrl);
+    u.searchParams.set('page', String(p));
+    pageUrls.push(u.href);
+  }
+
+  return {
+    pageUrls,
+    maxPage: startPage + pageUrls.length - 1,
+    catalogLast,
+    singlePage: false,
+  };
 }
 
 function looksLikeScriptShell(html) {
@@ -753,51 +760,70 @@ async function mapPool(items, concurrency, worker) {
 /**
  * Scrape a directory / white-pages listing: paginate → profiles → phones.
  */
-async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCode) {
-  const firstHtml = await fetchHtml(startUrl, browserHolder);
-  const { pageUrls, maxPage } = buildListingPageUrls(firstHtml, startUrl);
+async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCode, onProgress = () => {}) {
+  onProgress({ percent: 6, message: 'Reading listing page...' });
+  // Prefer fast axios for listing sites; puppeteer only as fallback inside fetchHtml
+  let firstHtml;
+  try {
+    firstHtml = await fetchWithAxios(startUrl);
+    if (looksLikeScriptShell(firstHtml)) {
+      firstHtml = await fetchHtml(startUrl, browserHolder);
+    }
+  } catch {
+    firstHtml = await fetchHtml(startUrl, browserHolder);
+  }
 
-  console.log(`[scraper] Listing detected. Pages to crawl: ${pageUrls.length} (maxPage=${maxPage})`);
+  const { pageUrls, maxPage, catalogLast, singlePage } = buildListingPageUrls(firstHtml, startUrl);
+  console.log(
+    `[scraper] Listing detected. pages=${pageUrls.length} windowEnd=${maxPage} catalogLast=${catalogLast} singlePage=${singlePage}`
+  );
+  onProgress({
+    percent: 8,
+    message: singlePage
+      ? 'Scraping this page profiles...'
+      : `Scanning up to ${pageUrls.length} listing pages (catalog has ~${catalogLast})...`,
+  });
 
   const profileSet = new Set();
   const leads = [];
 
-  // Always process first page HTML we already have
   for (const link of extractProfileLinks(firstHtml, startUrl)) {
     profileSet.add(link);
   }
   leads.push(...extractLeadsFromHtml(firstHtml, startUrl, defaultCountryCode));
 
-  // Remaining listing pages
-  const otherPages = pageUrls.filter((u) => {
+  const startNorm = (() => {
     try {
-      const a = new URL(u);
-      const b = new URL(startUrl);
-      return a.searchParams.get('page') !== (b.searchParams.get('page') || '1') || a.href !== b.href;
+      const u = new URL(startUrl);
+      return `${u.origin}${u.pathname}?page=${u.searchParams.get('page') || '1'}`;
     } catch {
-      return true;
+      return startUrl;
     }
-  });
-
-  // Skip page=1 duplicate of start
-  const pagesToFetch = otherPages.filter((u) => {
-    const p = new URL(u).searchParams.get('page');
-    return p && p !== '1';
-  });
+  })();
 
   let pagesDone = 0;
-  for (const pageUrl of pagesToFetch) {
+  for (const pageUrl of pageUrls) {
     if (profileSet.size >= MAX_PROFILE_PAGES) break;
     try {
-      const html = await fetchHtml(pageUrl, browserHolder);
+      const u = new URL(pageUrl);
+      const key = `${u.origin}${u.pathname}?page=${u.searchParams.get('page') || '1'}`;
+      if (key === startNorm && pagesDone === 0 && profileSet.size > 0) {
+        pagesDone += 1;
+        continue; // already have first page
+      }
+      const html = await fetchWithAxios(pageUrl).catch(() => null);
+      if (!html) continue;
       for (const link of extractProfileLinks(html, pageUrl)) {
         profileSet.add(link);
+        if (profileSet.size >= MAX_PROFILE_PAGES) break;
       }
       leads.push(...extractLeadsFromHtml(html, pageUrl, defaultCountryCode));
       pagesDone += 1;
-      if (pagesDone % 25 === 0) {
-        console.log(`[scraper] Listing pages: ${pagesDone}/${pagesToFetch.length}, profiles: ${profileSet.size}`);
-      }
+      const pct = 8 + Math.min(22, Math.round((pagesDone / Math.max(pageUrls.length, 1)) * 22));
+      onProgress({
+        percent: pct,
+        message: `Listing page ${pagesDone}/${pageUrls.length} · profiles ${profileSet.size}`,
+      });
       if (REQUEST_DELAY_MS > 0) await sleep(REQUEST_DELAY_MS);
     } catch (err) {
       console.warn(`[scraper] Listing page failed ${pageUrl}: ${err.message}`);
@@ -806,14 +832,28 @@ async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCod
 
   const profiles = [...profileSet].slice(0, MAX_PROFILE_PAGES);
   console.log(`[scraper] Fetching ${profiles.length} profile pages for phone numbers...`);
+  onProgress({
+    percent: 32,
+    message: `Opening ${profiles.length} profile pages for phone numbers...`,
+  });
 
-  const profileLeads = await mapPool(profiles, PROFILE_CONCURRENCY, async (profileUrl, i) => {
+  let profilesDone = 0;
+  const profileLeads = await mapPool(profiles, PROFILE_CONCURRENCY, async (profileUrl) => {
     try {
-      if (REQUEST_DELAY_MS > 0) await sleep(REQUEST_DELAY_MS * (i % PROFILE_CONCURRENCY));
+      if (REQUEST_DELAY_MS > 0) await sleep(REQUEST_DELAY_MS);
       const html = await fetchWithAxios(profileUrl).catch(() => null);
+      profilesDone += 1;
+      if (profilesDone % 5 === 0 || profilesDone === profiles.length) {
+        const pct = 32 + Math.min(48, Math.round((profilesDone / Math.max(profiles.length, 1)) * 48));
+        onProgress({
+          percent: pct,
+          message: `Profiles ${profilesDone}/${profiles.length} · numbers so far updating...`,
+        });
+      }
       if (!html) return [];
       return extractLeadsFromHtml(html, profileUrl, defaultCountryCode);
     } catch (err) {
+      profilesDone += 1;
       console.warn(`[scraper] Profile failed ${profileUrl}: ${err.message}`);
       return [];
     }
@@ -823,33 +863,54 @@ async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCod
     if (Array.isArray(batch)) leads.push(...batch);
   }
 
-  console.log(`[scraper] Listing scrape done. Raw leads: ${leads.length}`);
-  return dedupeLeads(leads);
+  const deduped = dedupeLeads(leads);
+  console.log(`[scraper] Listing scrape done. Raw=${leads.length} unique=${deduped.length}`);
+  onProgress({
+    percent: 82,
+    message: `Scraped ${deduped.length} unique numbers. Starting WhatsApp checks...`,
+  });
+  return deduped;
 }
 
-async function scrapeUrl(targetUrl) {
+async function scrapeUrl(targetUrl, onProgress = () => {}) {
   const parsed = assertHttpUrl(targetUrl);
   const browserHolder = { browser: null };
   const defaultCountryCode = countryCodeFromHost(parsed.hostname);
   const leads = [];
 
   try {
-    const homepage = await fetchHtml(parsed.href, browserHolder);
+    onProgress({ percent: 5, message: 'Fetching page...' });
+    let homepage;
+    try {
+      homepage = await fetchWithAxios(parsed.href);
+      if (looksLikeScriptShell(homepage)) {
+        homepage = await fetchHtml(parsed.href, browserHolder);
+      }
+    } catch {
+      homepage = await fetchHtml(parsed.href, browserHolder);
+    }
 
     if (isListingPage(homepage, parsed.href)) {
-      return await scrapeListingDirectory(parsed.href, browserHolder, defaultCountryCode);
+      return await scrapeListingDirectory(parsed.href, browserHolder, defaultCountryCode, onProgress);
     }
 
     leads.push(...extractLeadsFromHtml(homepage, parsed.href, defaultCountryCode));
+    onProgress({ percent: 40, message: `Found ${leads.length} numbers on main page...` });
 
     const pages = discoverInternalLinks(homepage, parsed.href).filter(
       (link) => link !== parsed.href
     );
 
+    let i = 0;
     for (const link of pages) {
       try {
         const html = await fetchHtml(link, browserHolder);
         leads.push(...extractLeadsFromHtml(html, link, defaultCountryCode));
+        i += 1;
+        onProgress({
+          percent: 40 + Math.round((i / Math.max(pages.length, 1)) * 40),
+          message: `Checked contact page ${i}/${pages.length}...`,
+        });
       } catch (error) {
         console.warn(`Skipped ${link}: ${error.message}`);
       }
@@ -858,7 +919,9 @@ async function scrapeUrl(targetUrl) {
     await closeBrowser(browserHolder);
   }
 
-  return dedupeLeads(leads);
+  const deduped = dedupeLeads(leads);
+  onProgress({ percent: 82, message: `Scraped ${deduped.length} unique numbers.` });
+  return deduped;
 }
 
 function unwrapGoogleHref(href) {
