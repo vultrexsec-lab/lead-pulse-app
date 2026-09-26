@@ -1,14 +1,18 @@
 /**
- * WhatsApp service — uses whatsapp-web.js (real Chromium / WhatsApp Web)
- * because Baileys QR pairing is currently broken upstream
- * (companion_reg_refresh → phone shows "Couldn't link device").
+ * WhatsApp connector
+ *
+ * Default engine: Baileys from PR branch that handles companion_reg_refresh
+ *   (fixes phone error: "Couldn't link device")
+ * Optional: WA_ENGINE=wwebjs for whatsapp-web.js / Chromium
  */
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const pino = require('pino');
+const axios = require('axios');
 
-const AUTH_DIR = path.join(__dirname, '..', 'auth_info_wwebjs');
-const BAILEYS_AUTH_DIR = path.join(__dirname, '..', 'auth_info_baileys');
+const ENGINE = String(process.env.WA_ENGINE || 'baileys').toLowerCase();
+const AUTH_DIR_BAILEYS = path.join(__dirname, '..', 'auth_info_baileys');
+const AUTH_DIR_WWEBJS = path.join(__dirname, '..', 'auth_info_wwebjs');
 
 const STATUS = {
   CONNECTED: 'CONNECTED',
@@ -16,13 +20,17 @@ const STATUS = {
   NEED_QR: 'NEED_QR',
 };
 
-let client = null;
+let sock = null;
+let wwebClient = null;
 let connectionStatus = STATUS.DISCONNECTED;
 let connectPromise = null;
 let checkQueue = Promise.resolve();
 let latestQR = '';
 let latestPairingCode = '';
-let initializing = false;
+let reconnectTimer = null;
+let intentionalClose = false;
+
+const logger = pino({ level: process.env.WA_LOG_LEVEL || 'silent' });
 
 function getConnectionStatus() {
   return connectionStatus;
@@ -46,33 +54,263 @@ function enqueue(task) {
   return run;
 }
 
-function clearAuthFolder() {
-  for (const dir of [AUTH_DIR, BAILEYS_AUTH_DIR]) {
-    try {
-      if (fs.existsSync(dir)) {
-        fs.rmSync(dir, { recursive: true, force: true });
-        console.log('[wa] Cleared', dir);
-      }
-    } catch (err) {
-      console.error('[wa] Auth cleanup error:', err.message);
+function clearDir(dir) {
+  try {
+    if (fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      console.log('[wa] Cleared', dir);
     }
-  }
-  // wwebjs also stores under .wwebjs_auth by default — we pin dataPath
-  const local = path.join(__dirname, '..', '.wwebjs_auth');
-  const cache = path.join(__dirname, '..', '.wwebjs_cache');
-  for (const dir of [local, cache]) {
-    try {
-      if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
-    } catch {
-      // ignore
-    }
+  } catch (err) {
+    console.error('[wa] clear error', dir, err.message);
   }
 }
+
+function clearAuthFolder() {
+  clearDir(AUTH_DIR_BAILEYS);
+  clearDir(AUTH_DIR_WWEBJS);
+  clearDir(path.join(__dirname, '..', '.wwebjs_auth'));
+  clearDir(path.join(__dirname, '..', '.wwebjs_cache'));
+}
+
+function clearReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function scheduleReconnect(delayMs = 2500) {
+  clearReconnectTimer();
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectWhatsApp().catch((err) => console.error('[wa] Reconnect failed:', err.message));
+  }, delayMs);
+}
+
+// ─── Version helpers (Baileys) ───────────────────────────────────────────────
+
+async function resolveWaVersion(baileysMod) {
+  if (typeof baileysMod.fetchLatestWaWebVersion === 'function') {
+    try {
+      const r = await baileysMod.fetchLatestWaWebVersion();
+      if (r?.version) {
+        console.log('[wa] WA version (WaWeb):', r.version.join('.'));
+        return r.version;
+      }
+    } catch (e) {
+      console.warn('[wa] fetchLatestWaWebVersion:', e.message);
+    }
+  }
+
+  if (typeof baileysMod.fetchLatestBaileysVersion === 'function') {
+    try {
+      const r = await baileysMod.fetchLatestBaileysVersion();
+      if (r?.version) {
+        console.log('[wa] WA version (Baileys):', r.version.join('.'));
+        return r.version;
+      }
+    } catch (e) {
+      console.warn('[wa] fetchLatestBaileysVersion:', e.message);
+    }
+  }
+
+  try {
+    const { data } = await axios.get('https://web.whatsapp.com/sw.js', {
+      timeout: 12000,
+      responseType: 'text',
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+      },
+    });
+    const m = String(data).match(/client_revision["'\s:=]+(\d{8,})/i);
+    if (m) {
+      const version = [2, 3000, Number(m[1])];
+      console.log('[wa] WA version (sw.js):', version.join('.'));
+      return version;
+    }
+  } catch (e) {
+    console.warn('[wa] sw.js version scrape failed:', e.message);
+  }
+
+  return [2, 3000, 1023223821];
+}
+
+// ─── Baileys engine ──────────────────────────────────────────────────────────
+
+async function destroyBaileys() {
+  intentionalClose = true;
+  clearReconnectTimer();
+  try {
+    if (sock) {
+      try {
+        sock.ev.removeAllListeners('connection.update');
+        sock.ev.removeAllListeners('creds.update');
+      } catch {
+        // ignore
+      }
+      try {
+        sock.end(undefined);
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore
+  }
+  sock = null;
+  intentionalClose = false;
+}
+
+async function openBaileys() {
+  await destroyBaileys();
+  await sleep(400);
+
+  // Prefer fixed fork (companion_reg_refresh). Falls back to npm package name.
+  let baileysMod;
+  try {
+    baileysMod = await import('baileys');
+  } catch {
+    baileysMod = await import('@whiskeysockets/baileys');
+  }
+
+  const makeWASocket = baileysMod.default || baileysMod.makeWASocket;
+  const {
+    useMultiFileAuthState,
+    DisconnectReason,
+    makeCacheableSignalKeyStore,
+    Browsers,
+  } = baileysMod;
+
+  fs.mkdirSync(AUTH_DIR_BAILEYS, { recursive: true });
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR_BAILEYS);
+  const version = await resolveWaVersion(baileysMod);
+
+  const browser =
+    typeof Browsers?.macOS === 'function'
+      ? Browsers.macOS('Desktop')
+      : ['Mac OS', 'Chrome', '14.4.1'];
+
+  console.log('[wa] Baileys engine · browser=', JSON.stringify(browser), '· version=', version.join('.'));
+
+  const socket = makeWASocket({
+    version,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger),
+    },
+    logger,
+    browser,
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    generateHighQualityLinkPreview: false,
+    connectTimeoutMs: 60_000,
+    defaultQueryTimeoutMs: 60_000,
+    keepAliveIntervalMs: 30_000,
+    qrTimeout: 60_000,
+    getMessage: async () => undefined,
+  });
+
+  sock = socket;
+  socket.ev.on('creds.update', saveCreds);
+
+  socket.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr, isNewLogin } = update;
+
+    if (qr) {
+      latestQR = qr;
+      connectionStatus = STATUS.NEED_QR;
+      console.log('[wa] QR ready → open /qr and scan within 60s');
+    }
+
+    if (isNewLogin) console.log('[wa] isNewLogin');
+
+    if (connection === 'open') {
+      latestQR = '';
+      latestPairingCode = '';
+      connectionStatus = STATUS.CONNECTED;
+      clearReconnectTimer();
+      console.log('[wa] CONNECTED (Baileys)');
+    }
+
+    if (connection === 'close') {
+      if (intentionalClose) return;
+
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      console.log('[wa] close code=', statusCode, lastDisconnect?.error?.message || '');
+
+      connectionStatus = STATUS.DISCONNECTED;
+      sock = null;
+
+      const loggedOut =
+        statusCode === DisconnectReason?.loggedOut || statusCode === 401 || statusCode === 403;
+      const restartRequired =
+        statusCode === DisconnectReason?.restartRequired || statusCode === 515;
+
+      if (loggedOut) {
+        latestQR = '';
+        clearDir(AUTH_DIR_BAILEYS);
+        scheduleReconnect(1500);
+        return;
+      }
+
+      if (restartRequired) {
+        console.log('[wa] 515 restartRequired — reconnecting with saved session');
+        scheduleReconnect(1000);
+        return;
+      }
+
+      scheduleReconnect(3000);
+    }
+  });
+
+  return socket;
+}
+
+async function baileysRequestPairingCode(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (digits.length < 10) {
+    const error = new Error('Phone with country code required, e.g. 919876543210');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!sock) {
+    await connectWhatsApp();
+    await sleep(2500);
+  }
+  if (!sock?.requestPairingCode) {
+    const error = new Error('Pairing code not available');
+    error.statusCode = 503;
+    throw error;
+  }
+  const code = await sock.requestPairingCode(digits);
+  latestPairingCode = code;
+  connectionStatus = STATUS.NEED_QR;
+  console.log('[wa] pairing code:', code);
+  return code;
+}
+
+async function baileysLookup(phoneNumber) {
+  if (connectionStatus !== STATUS.CONNECTED || !sock) {
+    const error = new Error('WhatsApp is not connected');
+    error.statusCode = 503;
+    throw error;
+  }
+  const normalized = formatPhoneNumber(phoneNumber);
+  const results = await sock.onWhatsApp(normalized);
+  const match = Array.isArray(results) ? results.find((item) => item?.exists) : null;
+  return {
+    phoneNumber: normalized,
+    exists: Boolean(match?.exists),
+    jid: match?.jid ?? null,
+  };
+}
+
+// ─── whatsapp-web.js engine ──────────────────────────────────────────────────
 
 function resolveChromePath() {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
   if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
-
   const candidates = [
     '/usr/bin/google-chrome-stable',
     '/usr/bin/google-chrome',
@@ -83,7 +321,6 @@ function resolveChromePath() {
   for (const p of candidates) {
     if (fs.existsSync(p)) return p;
   }
-
   try {
     const puppeteer = require('puppeteer');
     if (typeof puppeteer.executablePath === 'function') {
@@ -93,45 +330,112 @@ function resolveChromePath() {
   } catch {
     // ignore
   }
-
   return undefined;
 }
 
-async function destroyClient() {
-  if (!client) return;
+async function destroyWweb() {
+  if (!wwebClient) return;
   try {
-    client.removeAllListeners();
-    await client.destroy().catch(() => undefined);
+    wwebClient.removeAllListeners();
+    await wwebClient.destroy().catch(() => undefined);
   } catch {
     // ignore
   }
-  client = null;
+  wwebClient = null;
 }
 
-async function resetSession() {
-  console.log('[wa] Resetting WhatsApp session (wwebjs)...');
-  await destroyClient();
-  clearAuthFolder();
-  latestQR = '';
-  latestPairingCode = '';
-  connectionStatus = STATUS.DISCONNECTED;
-  connectPromise = null;
-  await sleep(500);
-  await connectWhatsApp();
-  return {
-    status: connectionStatus,
-    hasQr: Boolean(latestQR),
-    pairingCode: null,
+async function openWwebjs() {
+  await destroyWweb();
+  const { Client, LocalAuth } = require('whatsapp-web.js');
+  fs.mkdirSync(AUTH_DIR_WWEBJS, { recursive: true });
+
+  const chromePath = resolveChromePath();
+  const puppeteerOpts = {
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-first-run',
+      '--disable-extensions',
+    ],
   };
+  if (chromePath) puppeteerOpts.executablePath = chromePath;
+
+  console.log('[wa] wwebjs engine', chromePath || '(default chrome)');
+
+  const c = new Client({
+    authStrategy: new LocalAuth({ dataPath: AUTH_DIR_WWEBJS }),
+    puppeteer: puppeteerOpts,
+    qrMaxRetries: 12,
+  });
+
+  wwebClient = c;
+
+  c.on('qr', (qr) => {
+    latestQR = qr;
+    connectionStatus = STATUS.NEED_QR;
+    console.log('[wa] QR ready (wwebjs) → open /qr');
+  });
+  c.on('ready', () => {
+    latestQR = '';
+    connectionStatus = STATUS.CONNECTED;
+    console.log('[wa] CONNECTED (wwebjs)');
+  });
+  c.on('auth_failure', (msg) => {
+    console.error('[wa] wwebjs auth_failure', msg);
+    connectionStatus = STATUS.DISCONNECTED;
+  });
+  c.on('disconnected', (reason) => {
+    console.log('[wa] wwebjs disconnected', reason);
+    connectionStatus = STATUS.DISCONNECTED;
+    scheduleReconnect(4000);
+  });
+
+  await c.initialize();
+  return c;
 }
+
+async function wwebLookup(phoneNumber) {
+  if (connectionStatus !== STATUS.CONNECTED || !wwebClient) {
+    const error = new Error('WhatsApp is not connected');
+    error.statusCode = 503;
+    throw error;
+  }
+  const normalized = formatPhoneNumber(phoneNumber);
+  const chatId = `${normalized}@c.us`;
+  let exists = false;
+  try {
+    if (typeof wwebClient.isRegisteredUser === 'function') {
+      exists = Boolean(await wwebClient.isRegisteredUser(chatId));
+    } else {
+      const numberId = await wwebClient.getNumberId(chatId);
+      exists = Boolean(numberId);
+    }
+  } catch (err) {
+    console.warn('[wa] wweb check failed', normalized, err.message);
+    exists = false;
+  }
+  return { phoneNumber: normalized, exists, jid: exists ? chatId : null };
+}
+
+// ─── Public API ──────────────────────────────────────────────────────────────
 
 async function connectWhatsApp() {
-  if (connectionStatus === STATUS.CONNECTED && client) return client;
+  if (connectionStatus === STATUS.CONNECTED && (sock || wwebClient)) {
+    return sock || wwebClient;
+  }
   if (connectPromise) return connectPromise;
 
-  connectPromise = openClient()
+  connectPromise = (async () => {
+    if (ENGINE === 'wwebjs') {
+      return openWwebjs();
+    }
+    return openBaileys();
+  })()
     .catch((err) => {
-      console.error('[wa] openClient error:', err.message);
+      console.error('[wa] connect error:', err.message);
       connectionStatus = STATUS.DISCONNECTED;
       throw err;
     })
@@ -142,98 +446,27 @@ async function connectWhatsApp() {
   return connectPromise;
 }
 
-async function openClient() {
-  if (initializing) {
-    await sleep(1000);
-    if (client) return client;
-  }
-  initializing = true;
-
-  try {
-    await destroyClient();
-
-    const { Client, LocalAuth } = require('whatsapp-web.js');
-
-    fs.mkdirSync(AUTH_DIR, { recursive: true });
-
-    const chromePath = resolveChromePath();
-    console.log('[wa] Starting whatsapp-web.js', chromePath ? `chrome=${chromePath}` : '(default chrome)');
-
-    const puppeteerOpts = {
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--disable-extensions',
-      ],
-    };
-    if (chromePath) {
-      puppeteerOpts.executablePath = chromePath;
-    }
-
-    const c = new Client({
-      authStrategy: new LocalAuth({ dataPath: AUTH_DIR }),
-      puppeteer: puppeteerOpts,
-      qrMaxRetries: 10,
-    });
-
-    client = c;
-
-    c.on('qr', (qr) => {
-      latestQR = qr;
-      connectionStatus = STATUS.NEED_QR;
-      console.log('[wa] QR ready — open /qr and scan (Linked devices → Link a device)');
-    });
-
-    c.on('authenticated', () => {
-      console.log('[wa] Authenticated (session saved)');
-    });
-
-    c.on('ready', () => {
-      latestQR = '';
-      connectionStatus = STATUS.CONNECTED;
-      console.log('[wa] CONNECTED (whatsapp-web.js ready)');
-    });
-
-    c.on('auth_failure', (msg) => {
-      console.error('[wa] auth_failure:', msg);
-      connectionStatus = STATUS.DISCONNECTED;
-      latestQR = '';
-    });
-
-    c.on('disconnected', (reason) => {
-      console.log('[wa] disconnected:', reason);
-      connectionStatus = STATUS.DISCONNECTED;
-      latestQR = '';
-      // Auto-reinit after short delay (unless intentional destroy)
-      setTimeout(() => {
-        if (connectionStatus !== STATUS.CONNECTED) {
-          connectWhatsApp().catch((e) => console.error('[wa] reconnect failed:', e.message));
-        }
-      }, 4000);
-    });
-
-    c.on('loading_screen', (percent, message) => {
-      console.log(`[wa] loading ${percent}% ${message || ''}`);
-    });
-
-    await c.initialize();
-    return c;
-  } finally {
-    initializing = false;
-  }
+async function resetSession() {
+  console.log('[wa] Reset session · engine=', ENGINE);
+  clearReconnectTimer();
+  await destroyBaileys();
+  await destroyWweb();
+  clearAuthFolder();
+  latestQR = '';
+  latestPairingCode = '';
+  connectionStatus = STATUS.DISCONNECTED;
+  await sleep(600);
+  await connectWhatsApp();
+  return { status: connectionStatus, hasQr: Boolean(latestQR), pairingCode: latestPairingCode || null };
 }
 
-async function requestPairingCode(_phone) {
-  const error = new Error(
-    'Pairing code is not used with whatsapp-web.js. Open /qr and scan the QR code instead.'
-  );
-  error.statusCode = 400;
-  throw error;
+async function requestPairingCode(phone) {
+  if (ENGINE === 'wwebjs') {
+    const error = new Error('Pairing code only works with Baileys engine. Unset WA_ENGINE=wwebjs or use QR at /qr');
+    error.statusCode = 400;
+    throw error;
+  }
+  return baileysRequestPairingCode(phone);
 }
 
 function formatPhoneNumber(phoneNumber) {
@@ -255,44 +488,13 @@ function formatPhoneNumber(phoneNumber) {
   return digits;
 }
 
-function toChatId(digits) {
-  return `${digits}@c.us`;
-}
-
 async function checkNumberStatus(phoneNumber) {
   return enqueue(() => lookupNumber(phoneNumber));
 }
 
 async function lookupNumber(phoneNumber) {
-  if (connectionStatus !== STATUS.CONNECTED || !client) {
-    const error = new Error('WhatsApp is not connected');
-    error.statusCode = 503;
-    throw error;
-  }
-
-  const normalized = formatPhoneNumber(phoneNumber);
-  const chatId = toChatId(normalized);
-
-  let exists = false;
-  try {
-    // Prefer isRegisteredUser when available
-    if (typeof client.isRegisteredUser === 'function') {
-      exists = Boolean(await client.isRegisteredUser(chatId));
-    } else {
-      const numberId = await client.getNumberId(chatId);
-      exists = Boolean(numberId);
-    }
-  } catch (err) {
-    // Some accounts return false / throw for invalid — treat as not registered
-    console.warn('[wa] number check failed for', normalized, err.message);
-    exists = false;
-  }
-
-  return {
-    phoneNumber: normalized,
-    exists,
-    jid: exists ? chatId : null,
-  };
+  if (ENGINE === 'wwebjs') return wwebLookup(phoneNumber);
+  return baileysLookup(phoneNumber);
 }
 
 async function checkBulkNumbers(numbersArray, delayMs = 1200, onProgress) {
@@ -301,20 +503,12 @@ async function checkBulkNumbers(numbersArray, delayMs = 1200, onProgress) {
     error.statusCode = 400;
     throw error;
   }
-
   const results = [];
-
   for (let index = 0; index < numbersArray.length; index += 1) {
     results.push(await checkNumberStatus(numbersArray[index]));
-    if (typeof onProgress === 'function') {
-      onProgress(index + 1, numbersArray.length);
-    }
-
-    if (index < numbersArray.length - 1) {
-      await sleep(delayMs);
-    }
+    if (typeof onProgress === 'function') onProgress(index + 1, numbersArray.length);
+    if (index < numbersArray.length - 1) await sleep(delayMs);
   }
-
   return results;
 }
 
