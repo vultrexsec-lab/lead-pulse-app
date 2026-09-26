@@ -128,9 +128,17 @@ async function openSocket() {
 
 function formatPhoneNumber(phoneNumber) {
   let digits = String(phoneNumber ?? '').replace(/\D/g, '');
+  if (digits.startsWith('00')) digits = digits.slice(2);
   if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
-  if (digits.length === 10) digits = `91${digits}`;
-  if (!digits) {
+
+  // Do NOT force a country code. Preserve whatever international digits we received.
+  // Only as a last resort for classic Indian 10-digit mobiles (start 6-9), prefix 91.
+  // US/Canada 10-digit and other local numbers must already include country code from scraper.
+  if (digits.length === 10 && /^[6-9]/.test(digits)) {
+    digits = `91${digits}`;
+  }
+
+  if (!digits || digits.length < 8 || digits.length > 15) {
     const error = new Error('Valid phone number required');
     error.statusCode = 400;
     throw error;

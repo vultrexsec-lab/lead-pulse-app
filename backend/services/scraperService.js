@@ -5,23 +5,59 @@ const puppeteer = require('puppeteer');
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
+// Broader internal link discovery: path patterns + link text keywords
 const INTERNAL_LINK_PATTERNS = [
-  /\/contact-us(?:\/|$|\.)/i,
-  /\/contactus(?:\/|$|\.)/i,
-  /\/about-us(?:\/|$|\.)/i,
-  /\/aboutus(?:\/|$|\.)/i,
-  /\/contact(?:\/|$|\.)/i,
-  /\/about(?:\/|$|\.)/i,
+  /\/contact(?:-us|us)?(?:\/|$|\.)/i,
+  /\/about(?:-us|us)?(?:\/|$|\.)/i,
   /\/team(?:\/|$|\.)/i,
+  /\/staff(?:\/|$|\.)/i,
+  /\/people(?:\/|$|\.)/i,
+  /\/locations?(?:\/|$|\.)/i,
+  /\/offices?(?:\/|$|\.)/i,
+  /\/support(?:\/|$|\.)/i,
+  /\/get-in-touch(?:\/|$|\.)/i,
+  /\/reach-us(?:\/|$|\.)/i,
+  /\/connect(?:\/|$|\.)/i,
+  /\/enquiry(?:\/|$|\.)/i,
+  /\/inquiry(?:\/|$|\.)/i,
+  /\/find-us(?:\/|$|\.)/i,
+  /\/our-team(?:\/|$|\.)/i,
+  /\/directory(?:\/|$|\.)/i,
 ];
 
+const LINK_TEXT_KEYWORDS = [
+  'contact',
+  'about',
+  'team',
+  'call us',
+  'phone',
+  'reach us',
+  'get in touch',
+  'support',
+  'locations',
+  'office',
+  'enquiry',
+  'inquiry',
+  'find us',
+  'staff',
+  'directory',
+];
+
+// Strong international + local phone patterns
 const PHONE_PATTERNS = [
-  /(?:\+|00)\d{1,3}[\s.\-]*\d(?:[\d\s.\-()]{6,18}\d)/g,
-  /\(\d{2,5}\)[\s.\-]?\d{3,5}[\s.\-]?\d{3,5}/g,
-  /\b0\d{2,4}[\s.\-]\d{3,4}[\s.\-]\d{3,4}\b/g,
-  /\b0[6-9]\d{9}\b/g,
-  /\b[6-9]\d{4}[\s.\-]?\d{5}\b/g,
+  // +CC or 00CC followed by number (international)
+  /(?:\+|00)[1-9]\d{0,3}[\s.\-()]*\d(?:[\d\s.\-()]{5,18}\d)/g,
+  // (XXX) XXX-XXXX style
+  /\(\d{2,5}\)[\s.\-]?\d{2,5}[\s.\-]?\d{2,6}/g,
+  // 0XX-XXX-XXXX local with leading 0
+  /\b0\d{1,4}[\s.\-]\d{2,5}[\s.\-]\d{2,6}\b/g,
+  // Indian mobile 10-digit starting 6-9
   /\b[6-9]\d{9}\b/g,
+  // Indian with spaces/dashes 5+5
+  /\b[6-9]\d{4}[\s.\-]?\d{5}\b/g,
+  // Generic 10-15 digit sequences that look like phones (word boundary)
+  /\b\d{3}[\s.\-]\d{3}[\s.\-]\d{4}\b/g,
+  /\b\d{2,4}[\s.\-]\d{3,4}[\s.\-]\d{3,4}\b/g,
 ];
 
 const CALLING_CODES = {
@@ -52,6 +88,26 @@ const CALLING_CODES = {
   nepal: '977',
   'sri lanka': '94',
 };
+
+// Known valid country calling codes (subset, most common)
+const VALID_COUNTRY_CODES = new Set([
+  '1', '7', '20', '27', '30', '31', '32', '33', '34', '36', '39', '40', '41', '43', '44', '45',
+  '46', '47', '48', '49', '51', '52', '53', '54', '55', '56', '57', '58', '60', '61', '62', '63',
+  '64', '65', '66', '81', '82', '84', '86', '90', '91', '92', '93', '94', '95', '98', '212',
+  '213', '216', '218', '220', '221', '222', '223', '224', '225', '226', '227', '228', '229',
+  '230', '231', '232', '233', '234', '235', '236', '237', '238', '239', '240', '241', '242',
+  '243', '244', '245', '246', '248', '249', '250', '251', '252', '253', '254', '255', '256',
+  '257', '258', '260', '261', '262', '263', '264', '265', '266', '267', '268', '269', '290',
+  '291', '297', '298', '299', '350', '351', '352', '353', '354', '355', '356', '357', '358',
+  '359', '370', '371', '372', '373', '374', '375', '376', '377', '378', '380', '381', '382',
+  '383', '385', '386', '387', '389', '420', '421', '423', '500', '501', '502', '503', '504',
+  '505', '506', '507', '508', '509', '590', '591', '592', '593', '594', '595', '596', '597',
+  '598', '599', '670', '672', '673', '674', '675', '676', '677', '678', '679', '680', '681',
+  '682', '683', '685', '686', '687', '688', '689', '690', '691', '692', '850', '852', '853',
+  '855', '856', '880', '886', '960', '961', '962', '963', '964', '965', '966', '967', '968',
+  '970', '971', '972', '973', '974', '975', '976', '977', '992', '993', '994', '995', '996',
+  '998',
+]);
 
 const SKIP_RESULT_HOSTS = [
   'google.',
@@ -91,41 +147,87 @@ function assertHttpUrl(value) {
   return parsed;
 }
 
+/**
+ * Normalize a raw phone string into digits-only international form.
+ * - Preserves country code when present (+ or 00 or known length).
+ * - Does NOT force India (+91) or any other country.
+ * - Returns null for invalid / junk numbers.
+ */
 function normalizePhone(raw) {
   const source = String(raw || '').trim();
   if (!source) return null;
+
+  const hadPlusOr00 = /^(?:\+|00)/.test(source.replace(/\s/g, '')) || source.includes('+');
 
   let digits = source.replace(/\D/g, '');
   if (digits.startsWith('00')) {
     digits = digits.slice(2);
   }
 
-  if (digits.length === 11 && digits.startsWith('0')) {
+  // Leading trunk 0 for local numbers (e.g. 09876... -> 9876...)
+  if (!hadPlusOr00 && digits.length >= 11 && digits.startsWith('0')) {
     digits = digits.slice(1);
   }
 
-  if (
-    digits.length === 12 &&
-    digits.startsWith('91') &&
-    /^[6-9]/.test(digits.slice(2))
-  ) {
-    digits = digits.slice(2);
+  if (digits.length < 8 || digits.length > 15) return null;
+  if (/^(\d)\1{7,}$/.test(digits)) return null; // all same digit
+
+  // If original had international indicator, keep full digits as-is
+  if (hadPlusOr00) {
+    // Must start with a plausible country code
+    if (!startsWithValidCountryCode(digits)) return null;
+    return digits;
   }
 
-  if (digits.length < 10 || digits.length > 15) return null;
-  if (/^(\d)\1+$/.test(digits)) return null;
-  const hasPhoneShape = /[+\-().]/.test(source) || /\s/.test(source);
-  if (digits.length === 10 && !/^[6-9]/.test(digits) && !hasPhoneShape) {
-    return null;
+  // No explicit country code in source.
+  // Accept common local shapes:
+  // - 10 digits (many countries)
+  // - 11 digits starting with country-like prefix already present in digits
+  if (digits.length === 10) {
+    return digits;
   }
 
-  return digits;
+  if (digits.length >= 11 && startsWithValidCountryCode(digits)) {
+    return digits;
+  }
+
+  // 8-9 digit local (some countries) — keep if looks phone-like
+  if (digits.length >= 8 && digits.length <= 9) {
+    const hasPhoneShape = /[+\-().\s]/.test(source);
+    if (hasPhoneShape) return digits;
+  }
+
+  return null;
 }
 
+function startsWithValidCountryCode(digits) {
+  // Try 1, 2, 3 digit codes
+  for (const len of [1, 2, 3]) {
+    if (digits.length > len && VALID_COUNTRY_CODES.has(digits.slice(0, len))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Apply country code ONLY as fallback for clearly local numbers
+ * during keyword+country search. Never override an existing country code.
+ */
 function applyCountryCode(number, country) {
+  if (!number) return number;
   const code = CALLING_CODES[cleanText(country).toLowerCase()];
-  if (!code || number.startsWith(code)) return number;
-  if (number.length === 10) return `${code}${number}`;
+  if (!code) return number;
+
+  // Already has this or another country code
+  if (number.startsWith(code)) return number;
+  if (startsWithValidCountryCode(number) && number.length > 10) return number;
+
+  // Only prefix local-looking numbers
+  if (number.length === 10 || number.length === 9 || number.length === 8) {
+    return `${code}${number}`;
+  }
+
   return number;
 }
 
@@ -195,6 +297,9 @@ function contextName($, element, fallback) {
   return fallback;
 }
 
+/**
+ * Extract phone numbers from HTML using multiple strategies.
+ */
 function extractLeadsFromHtml(html, pageUrl) {
   const $ = cheerio.load(html);
   $('script, style, noscript, svg').remove();
@@ -214,21 +319,95 @@ function extractLeadsFromHtml(html, pageUrl) {
     });
   };
 
-  $('a[href^="tel:"]').each((_, element) => {
+  // 1. tel: links (most reliable)
+  $('a[href^="tel:"], a[href^="TEL:"], a[href^="Tel:"]').each((_, element) => {
     const href = $(element).attr('href') || '';
-    const raw = decodeURIComponent(href.replace(/^tel:/i, '').split('?')[0]);
+    const raw = decodeURIComponent(href.replace(/^tel:/i, '').split('?')[0].split(';')[0]);
     addLead(raw, contextName($, element, fallbackName));
   });
 
+  // 2. data attributes commonly used for phones
+  $('[data-phone], [data-tel], [data-telephone], [data-mobile], [data-contact], [itemprop="telephone"]').each(
+    (_, element) => {
+      const attrs = ['data-phone', 'data-tel', 'data-telephone', 'data-mobile', 'data-contact', 'content'];
+      for (const attr of attrs) {
+        const val = $(element).attr(attr);
+        if (val) addLead(val, contextName($, element, fallbackName));
+      }
+      const text = cleanText($(element).text());
+      if (text) addLead(text, contextName($, element, fallbackName));
+    }
+  );
+
+  // 3. JSON-LD structured data
+  $('script[type="application/ld+json"]').each((_, element) => {
+    try {
+      const data = JSON.parse($(element).html() || '{}');
+      const items = Array.isArray(data) ? data : [data];
+      for (const item of items) {
+        walkJsonForPhones(item, (phone) => addLead(phone, fallbackName));
+      }
+    } catch {
+      // ignore invalid JSON-LD
+    }
+  });
+
+  // 4. Meta tags
+  $('meta[property="og:phone_number"], meta[name="telephone"], meta[name="phone"], meta[itemprop="telephone"]').each(
+    (_, element) => {
+      const content = $(element).attr('content');
+      if (content) addLead(content, fallbackName);
+    }
+  );
+
+  // 5. Visible body text with regex patterns
   const text = $('body').text();
   for (const pattern of PHONE_PATTERNS) {
+    // Reset lastIndex for global regex
+    pattern.lastIndex = 0;
     const matches = text.match(pattern) || [];
     for (const raw of matches) {
       addLead(raw, nearbyName($, raw, fallbackName));
     }
   }
 
+  // 6. Also scan entire HTML source for tel: and phone-like strings that cheerio text may miss
+  const htmlSource = String(html || '');
+  const telMatches = htmlSource.match(/tel:[\s]*[+0-9()\-.\s]{8,20}/gi) || [];
+  for (const m of telMatches) {
+    addLead(m.replace(/^tel:\s*/i, ''), fallbackName);
+  }
+
   return leads;
+}
+
+function walkJsonForPhones(obj, cb, depth = 0) {
+  if (!obj || depth > 8) return;
+  if (typeof obj === 'string') {
+    if (/(?:\+|00)?[\d\s.\-()]{8,}/.test(obj)) cb(obj);
+    return;
+  }
+  if (Array.isArray(obj)) {
+    for (const item of obj) walkJsonForPhones(item, cb, depth + 1);
+    return;
+  }
+  if (typeof obj === 'object') {
+    for (const [key, value] of Object.entries(obj)) {
+      const k = key.toLowerCase();
+      if (
+        k.includes('phone') ||
+        k.includes('telephone') ||
+        k.includes('mobile') ||
+        k.includes('tel') ||
+        k === 'contactpoint'
+      ) {
+        if (typeof value === 'string') cb(value);
+        else walkJsonForPhones(value, cb, depth + 1);
+      } else {
+        walkJsonForPhones(value, cb, depth + 1);
+      }
+    }
+  }
 }
 
 function discoverInternalLinks(html, pageUrl) {
@@ -250,13 +429,47 @@ function discoverInternalLinks(html, pageUrl) {
     }
 
     if (resolved.origin !== origin.origin) return;
-    if (!INTERNAL_LINK_PATTERNS.some((pattern) => pattern.test(resolved.pathname))) return;
+    if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') return;
 
     resolved.hash = '';
-    links.add(resolved.href);
+    const path = resolved.pathname || '/';
+    const linkText = cleanText($(element).text()).toLowerCase();
+
+    const pathMatch = INTERNAL_LINK_PATTERNS.some((pattern) => pattern.test(path));
+    const textMatch = LINK_TEXT_KEYWORDS.some((kw) => linkText.includes(kw));
+
+    if (pathMatch || textMatch) {
+      links.add(resolved.href);
+    }
   });
 
-  return [...links].slice(0, 8);
+  // Also check footer/nav areas more aggressively for any internal links with short paths
+  $('footer a[href], nav a[href], header a[href], [role="navigation"] a[href]').each((_, element) => {
+    const href = $(element).attr('href');
+    if (!href || href.startsWith('#') || href.startsWith('mailto:') || href.startsWith('tel:')) return;
+
+    let resolved;
+    try {
+      resolved = new URL(href, origin);
+    } catch {
+      return;
+    }
+    if (resolved.origin !== origin.origin) return;
+    resolved.hash = '';
+    const path = (resolved.pathname || '/').toLowerCase();
+    if (
+      path.includes('contact') ||
+      path.includes('about') ||
+      path.includes('team') ||
+      path.includes('support') ||
+      path.includes('location') ||
+      path.includes('office')
+    ) {
+      links.add(resolved.href);
+    }
+  });
+
+  return [...links].slice(0, 12);
 }
 
 function looksLikeScriptShell(html) {
@@ -268,13 +481,13 @@ function looksLikeScriptShell(html) {
 
 async function fetchWithAxios(url) {
   const response = await axios.get(url, {
-    timeout: 15000,
+    timeout: 18000,
     maxRedirects: 5,
-    maxContentLength: 2 * 1024 * 1024,
+    maxContentLength: 3 * 1024 * 1024,
     responseType: 'text',
     headers: {
       'User-Agent': USER_AGENT,
-      Accept: 'text/html,application/xhtml+xml',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9',
     },
     validateStatus: (status) => status >= 200 && status < 400,
@@ -288,7 +501,12 @@ async function getBrowser(browserHolder) {
 
   browserHolder.browser = await puppeteer.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+    ],
   });
 
   return browserHolder.browser;
@@ -300,7 +518,30 @@ async function fetchWithPuppeteer(url, browserHolder) {
 
   try {
     await page.setUserAgent(USER_AGENT);
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.setViewport({ width: 1366, height: 768 });
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 35000 }).catch(() =>
+      page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+    );
+
+    // Scroll to trigger lazy-loaded content
+    await page.evaluate(async () => {
+      await new Promise((resolve) => {
+        let total = 0;
+        const distance = 400;
+        const timer = setInterval(() => {
+          window.scrollBy(0, distance);
+          total += distance;
+          if (total >= document.body.scrollHeight || total > 4000) {
+            clearInterval(timer);
+            resolve();
+          }
+        }, 150);
+      });
+    }).catch(() => undefined);
+
+    // Small wait for any late content
+    await new Promise((r) => setTimeout(r, 800));
+
     return await page.content();
   } finally {
     await page.close().catch(() => undefined);
@@ -341,8 +582,8 @@ function dedupeLeads(leads) {
       continue;
     }
 
-    const existingIsSearch = /google\./i.test(existing.sourceUrl);
-    const nextIsSearch = /google\./i.test(lead.sourceUrl);
+    const existingIsSearch = /google\./i.test(existing.sourceUrl || '');
+    const nextIsSearch = /google\./i.test(lead.sourceUrl || '');
     if (existingIsSearch && !nextIsSearch) {
       byNumber.set(lead.number, lead);
     }
@@ -461,6 +702,7 @@ async function scrapeByKeywordAndCountry(keyword, country) {
         for (const lead of siteLeads) {
           leads.push({
             name: lead.name === 'Unknown' ? site.name : lead.name,
+            // Only apply country code if the number looks local (no country code yet)
             number: applyCountryCode(lead.number, cleanCountry),
             sourceUrl: lead.sourceUrl || site.url,
           });
@@ -479,4 +721,7 @@ async function scrapeByKeywordAndCountry(keyword, country) {
 module.exports = {
   scrapeUrl,
   scrapeByKeywordAndCountry,
+  // exported for testing
+  normalizePhone,
+  applyCountryCode,
 };
