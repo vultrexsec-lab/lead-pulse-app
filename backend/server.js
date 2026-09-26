@@ -70,7 +70,13 @@ const handleQR = async function (req, res) {
   }
 
   if (!qr) {
-    return res.status(200).json({ status: 'generating', message: 'Generating QR, refresh in 3s' });
+    var lastErr = typeof whatsappService.getLastError === 'function' ? whatsappService.getLastError() : '';
+    return res.status(200).json({
+      status: 'generating',
+      message: lastErr ? ('QR not ready: ' + lastErr) : 'Generating QR, refresh in 3s (on Render Chrome needs @sparticuz/chromium)',
+      lastError: lastErr || null,
+      hint: 'Render.com needs @sparticuz/chromium. After deploy wait 30-60s and refresh. Check Render logs for [wa] lines.'
+    });
   }
 
   // Always prefer local PNG — third-party QR APIs can corrupt long Baileys payloads

@@ -1,7 +1,6 @@
 /**
- * WhatsApp via whatsapp-web.js (real Chromium + web.whatsapp.com).
- * Baileys QR pairing is unreliable (companion_reg_refresh); official Web works
- * for this account, so we use the same Web path through Puppeteer.
+ * WhatsApp via whatsapp-web.js
+ * Supports local Chrome + Render/serverless via @sparticuz/chromium
  */
 const fs = require('fs');
 const path = require('path');
@@ -21,6 +20,7 @@ let checkQueue = Promise.resolve();
 let latestQR = '';
 let latestPairingCode = '';
 let lastError = '';
+let initStartedAt = 0;
 
 function getConnectionStatus() {
   return connectionStatus;
@@ -67,39 +67,96 @@ function clearAuthFolder() {
   }
 }
 
-function resolveChromePath() {
+function isRenderLike() {
+  return Boolean(
+    process.env.RENDER ||
+      process.env.RENDER_SERVICE_ID ||
+      process.env.AWS_LAMBDA_FUNCTION_NAME ||
+      process.env.VERCEL ||
+      process.env.RAILWAY_ENVIRONMENT
+  );
+}
+
+async function resolvePuppeteerConfig() {
+  // 1) Explicit path
   if (process.env.PUPPETEER_EXECUTABLE_PATH && fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH)) {
-    return process.env.PUPPETEER_EXECUTABLE_PATH;
+    return {
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+      headless: true,
+    };
   }
   if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) {
-    return process.env.CHROME_PATH;
+    return {
+      executablePath: process.env.CHROME_PATH,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+      headless: true,
+    };
   }
 
+  // 2) Render / serverless — @sparticuz/chromium
+  if (isRenderLike() || process.env.USE_SPARTICUZ_CHROMIUM === '1') {
+    try {
+      const chromium = require('@sparticuz/chromium');
+      const executablePath = await chromium.executablePath();
+      console.log('[wa] Using @sparticuz/chromium for Render/serverless');
+      return {
+        executablePath,
+        args: chromium.args,
+        headless: chromium.headless,
+        defaultViewport: chromium.defaultViewport,
+        ignoreHTTPSErrors: true,
+      };
+    } catch (e) {
+      console.error('[wa] @sparticuz/chromium failed:', e.message);
+      lastError = `@sparticuz/chromium missing or failed: ${e.message}. Run: npm install @sparticuz/chromium`;
+    }
+  }
+
+  // 3) System chrome
   const candidates = [
     '/usr/bin/google-chrome-stable',
     '/usr/bin/google-chrome',
     '/usr/bin/chromium-browser',
     '/usr/bin/chromium',
     '/snap/bin/chromium',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    'C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe',
-    'C:\\\\Program Files (x86)\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe',
   ];
   for (const p of candidates) {
-    if (fs.existsSync(p)) return p;
+    if (fs.existsSync(p)) {
+      console.log('[wa] Using system browser', p);
+      return {
+        executablePath: p,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+        headless: true,
+      };
+    }
   }
 
+  // 4) puppeteer bundled chrome
   try {
     const puppeteer = require('puppeteer');
     if (typeof puppeteer.executablePath === 'function') {
       const ep = puppeteer.executablePath();
-      if (ep && fs.existsSync(ep)) return ep;
+      if (ep && fs.existsSync(ep)) {
+        console.log('[wa] Using puppeteer chrome', ep);
+        return {
+          executablePath: ep,
+          args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+          headless: true,
+        };
+      }
     }
   } catch {
     // ignore
   }
 
-  return undefined;
+  lastError =
+    'No Chrome/Chromium found. On Render: npm install @sparticuz/chromium. Local: install Chrome or set PUPPETEER_EXECUTABLE_PATH.';
+  console.error('[wa]', lastError);
+  return {
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    headless: true,
+  };
 }
 
 async function destroyClient() {
@@ -163,70 +220,48 @@ async function openClient() {
   try {
     ({ Client, LocalAuth } = require('whatsapp-web.js'));
   } catch (e) {
-    throw new Error(
-      'whatsapp-web.js not installed. Run: cd backend && npm install whatsapp-web.js'
-    );
+    lastError = 'whatsapp-web.js not installed';
+    throw new Error(lastError + '. Run: npm install whatsapp-web.js');
   }
 
   fs.mkdirSync(AUTH_DIR, { recursive: true });
 
-  const chromePath = resolveChromePath();
-  if (!chromePath) {
-    console.warn(
-      '[wa] WARNING: No Chrome/Chromium found. Install Chrome or set PUPPETEER_EXECUTABLE_PATH'
-    );
-  } else {
-    console.log('[wa] Using browser:', chromePath);
-  }
-
-  const puppeteerOpts = {
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--disable-gpu',
-      '--disable-extensions',
-      '--disable-background-networking',
-      '--disable-default-apps',
-      '--disable-sync',
-      '--disable-translate',
-      '--mute-audio',
-      '--hide-scrollbars',
-    ],
-  };
-  if (chromePath) {
-    puppeteerOpts.executablePath = chromePath;
-  }
+  const puppeteerConfig = await resolvePuppeteerConfig();
+  initStartedAt = Date.now();
 
   const c = new Client({
     authStrategy: new LocalAuth({
       dataPath: AUTH_DIR,
       clientId: 'lead-pulse',
     }),
-    puppeteer: puppeteerOpts,
-    qrMaxRetries: 15,
-    authTimeoutMs: 120000,
+    puppeteer: {
+      ...puppeteerConfig,
+      args: [
+        ...(puppeteerConfig.args || []),
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--mute-audio',
+      ],
+    },
+    qrMaxRetries: 20,
+    authTimeoutMs: 180000,
     takeoverOnConflict: true,
-    takeoverTimeoutMs: 10000,
+    takeoverTimeoutMs: 15000,
   });
 
   client = c;
 
   c.on('qr', (qr) => {
-    // whatsapp-web.js QR is the same payload official Web uses
     latestQR = qr;
     connectionStatus = STATUS.NEED_QR;
     lastError = '';
     console.log(
-      '[wa] QR ready (official Web session) len=%s preview=%s',
+      '[wa] QR ready len=%s after %sms',
       String(qr).length,
-      String(qr).slice(0, 40)
+      Date.now() - initStartedAt
     );
-    console.log('[wa] Open /qr  →  scan like web.whatsapp.com (within ~60s)');
   });
 
   c.on('loading_screen', (percent, message) => {
@@ -234,14 +269,14 @@ async function openClient() {
   });
 
   c.on('authenticated', () => {
-    console.log('[wa] Authenticated — session saving...');
+    console.log('[wa] Authenticated');
   });
 
   c.on('ready', () => {
     latestQR = '';
     connectionStatus = STATUS.CONNECTED;
     lastError = '';
-    console.log('[wa] CONNECTED — ready for number checks');
+    console.log('[wa] CONNECTED');
   });
 
   c.on('auth_failure', (msg) => {
@@ -255,23 +290,20 @@ async function openClient() {
     console.log('[wa] disconnected:', reason);
     connectionStatus = STATUS.DISCONNECTED;
     latestQR = '';
-    // soft reconnect
     setTimeout(() => {
       if (connectionStatus !== STATUS.CONNECTED) {
         connectWhatsApp().catch((e) => console.error('[wa] reconnect:', e.message));
       }
-    }, 5000);
+    }, 8000);
   });
 
-  console.log('[wa] Starting whatsapp-web.js (same path as web.whatsapp.com)...');
+  console.log('[wa] initialize whatsapp-web.js...');
   await c.initialize();
   return c;
 }
 
-async function requestPairingCode(_phone) {
-  const error = new Error(
-    'Use QR scan at /qr (same as web.whatsapp.com). Pairing code is not required with this engine.'
-  );
+async function requestPairingCode() {
+  const error = new Error('Scan QR at /qr (whatsapp-web.js uses official Web login).');
   error.statusCode = 400;
   throw error;
 }
@@ -301,7 +333,11 @@ async function checkNumberStatus(phoneNumber) {
 
 async function lookupNumber(phoneNumber) {
   if (connectionStatus !== STATUS.CONNECTED || !client) {
-    const error = new Error('WhatsApp is not connected — open /qr and scan first');
+    const error = new Error(
+      lastError
+        ? `WhatsApp not connected: ${lastError}`
+        : 'WhatsApp is not connected — open /qr and wait for QR image'
+    );
     error.statusCode = 503;
     throw error;
   }
@@ -339,12 +375,8 @@ async function checkBulkNumbers(numbersArray, delayMs = 1000, onProgress) {
   const results = [];
   for (let index = 0; index < numbersArray.length; index += 1) {
     results.push(await checkNumberStatus(numbersArray[index]));
-    if (typeof onProgress === 'function') {
-      onProgress(index + 1, numbersArray.length);
-    }
-    if (index < numbersArray.length - 1) {
-      await sleep(delayMs);
-    }
+    if (typeof onProgress === 'function') onProgress(index + 1, numbersArray.length);
+    if (index < numbersArray.length - 1) await sleep(delayMs);
   }
   return results;
 }
