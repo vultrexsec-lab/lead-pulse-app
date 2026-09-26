@@ -1,9 +1,14 @@
+/**
+ * WhatsApp service — uses whatsapp-web.js (real Chromium / WhatsApp Web)
+ * because Baileys QR pairing is currently broken upstream
+ * (companion_reg_refresh → phone shows "Couldn't link device").
+ */
 const fs = require('fs');
 const path = require('path');
-const pino = require('pino');
-const axios = require('axios');
+const { execSync } = require('child_process');
 
-const AUTH_DIR = path.join(__dirname, '..', 'auth_info_baileys');
+const AUTH_DIR = path.join(__dirname, '..', 'auth_info_wwebjs');
+const BAILEYS_AUTH_DIR = path.join(__dirname, '..', 'auth_info_baileys');
 
 const STATUS = {
   CONNECTED: 'CONNECTED',
@@ -11,16 +16,13 @@ const STATUS = {
   NEED_QR: 'NEED_QR',
 };
 
-let sock = null;
+let client = null;
 let connectionStatus = STATUS.DISCONNECTED;
 let connectPromise = null;
 let checkQueue = Promise.resolve();
 let latestQR = '';
 let latestPairingCode = '';
-let reconnectTimer = null;
-let intentionalClose = false;
-
-const logger = pino({ level: process.env.WA_LOG_LEVEL || 'silent' });
+let initializing = false;
 
 function getConnectionStatus() {
   return connectionStatus;
@@ -45,159 +47,92 @@ function enqueue(task) {
 }
 
 function clearAuthFolder() {
-  try {
-    if (fs.existsSync(AUTH_DIR)) {
-      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-      console.log('[wa] Cleared session directory');
+  for (const dir of [AUTH_DIR, BAILEYS_AUTH_DIR]) {
+    try {
+      if (fs.existsSync(dir)) {
+        fs.rmSync(dir, { recursive: true, force: true });
+        console.log('[wa] Cleared', dir);
+      }
+    } catch (err) {
+      console.error('[wa] Auth cleanup error:', err.message);
     }
-  } catch (err) {
-    console.error('[wa] Auth dir cleanup error:', err.message);
+  }
+  // wwebjs also stores under .wwebjs_auth by default — we pin dataPath
+  const local = path.join(__dirname, '..', '.wwebjs_auth');
+  const cache = path.join(__dirname, '..', '.wwebjs_cache');
+  for (const dir of [local, cache]) {
+    try {
+      if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
   }
 }
 
-function clearReconnectTimer() {
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
+function resolveChromePath() {
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
+  if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
+
+  const candidates = [
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/snap/bin/chromium',
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
   }
-}
 
-function scheduleReconnect(delayMs = 2500) {
-  clearReconnectTimer();
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectWhatsApp().catch((err) => console.error('[wa] Reconnect failed:', err.message));
-  }, delayMs);
-}
-
-async function disconnectSocket() {
-  intentionalClose = true;
-  clearReconnectTimer();
   try {
-    if (sock) {
-      try {
-        sock.ev.removeAllListeners('connection.update');
-        sock.ev.removeAllListeners('creds.update');
-      } catch {
-        // ignore
-      }
-      try {
-        sock.end(undefined);
-      } catch {
-        // ignore
-      }
+    const puppeteer = require('puppeteer');
+    if (typeof puppeteer.executablePath === 'function') {
+      const ep = puppeteer.executablePath();
+      if (ep && fs.existsSync(ep)) return ep;
     }
   } catch {
     // ignore
   }
-  sock = null;
-  intentionalClose = false;
+
+  return undefined;
+}
+
+async function destroyClient() {
+  if (!client) return;
+  try {
+    client.removeAllListeners();
+    await client.destroy().catch(() => undefined);
+  } catch {
+    // ignore
+  }
+  client = null;
 }
 
 async function resetSession() {
-  console.log('[wa] Resetting WhatsApp session...');
-  await disconnectSocket();
+  console.log('[wa] Resetting WhatsApp session (wwebjs)...');
+  await destroyClient();
   clearAuthFolder();
   latestQR = '';
   latestPairingCode = '';
   connectionStatus = STATUS.DISCONNECTED;
-  await sleep(800);
+  connectPromise = null;
+  await sleep(500);
   await connectWhatsApp();
   return {
     status: connectionStatus,
     hasQr: Boolean(latestQR),
-    pairingCode: latestPairingCode || null,
+    pairingCode: null,
   };
 }
 
-/**
- * Resolve a current WhatsApp Web client version.
- * Stale versions are a common cause of "Couldn't link device".
- */
-async function resolveWaVersion(baileysMod) {
-  // 1) Official helper when present (Baileys 6.7+ / 7.x)
-  if (typeof baileysMod.fetchLatestWaWebVersion === 'function') {
-    try {
-      const r = await baileysMod.fetchLatestWaWebVersion();
-      if (r?.version) {
-        console.log('[wa] version via fetchLatestWaWebVersion:', r.version.join('.'));
-        return r.version;
-      }
-    } catch (e) {
-      console.warn('[wa] fetchLatestWaWebVersion failed:', e.message);
-    }
-  }
-
-  // 2) Baileys cache helper (often stale — use last)
-  let baileysVersion = null;
-  if (typeof baileysMod.fetchLatestBaileysVersion === 'function') {
-    try {
-      const r = await baileysMod.fetchLatestBaileysVersion();
-      if (r?.version) baileysVersion = r.version;
-    } catch (e) {
-      console.warn('[wa] fetchLatestBaileysVersion failed:', e.message);
-    }
-  }
-
-  // 3) Scrape live revision from web.whatsapp.com
-  try {
-    const { data } = await axios.get('https://web.whatsapp.com/', {
-      timeout: 12000,
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-      validateStatus: (s) => s >= 200 && s < 400,
-    });
-    const html = String(data || '');
-    // common patterns in WA web HTML / bootstrap
-    const patterns = [
-      /\"client_revision\"\s*:\s*(\d+)/i,
-      /client_revision[\"'\s:=]+(\d{8,})/i,
-      /\"version\"\s*:\s*\"(\d+)\.(\d+)\.(\d+)\"/,
-      /\"appVersion\"\s*:\s*\"(\d+)\.(\d+)\.(\d+)\"/,
-    ];
-    for (const re of patterns) {
-      const m = html.match(re);
-      if (m && m[1] && m[2] && m[3]) {
-        const version = [Number(m[1]), Number(m[2]), Number(m[3])];
-        console.log('[wa] version via web.whatsapp.com HTML:', version.join('.'));
-        return version;
-      }
-      if (m && m[1] && !m[2]) {
-        // client_revision style → map to [2, 3000, revision]
-        const revision = Number(m[1]);
-        if (Number.isFinite(revision) && revision > 1000000) {
-          const version = [2, 3000, revision];
-          console.log('[wa] version via client_revision:', version.join('.'));
-          return version;
-        }
-      }
-    }
-  } catch (e) {
-    console.warn('[wa] web.whatsapp.com version scrape failed:', e.message);
-  }
-
-  if (baileysVersion) {
-    console.log('[wa] fallback baileys version:', baileysVersion.join('.'));
-    return baileysVersion;
-  }
-
-  // Last-resort known-good shape (may still be rejected if too old)
-  console.warn('[wa] using hardcoded fallback version');
-  return [2, 3000, 1023223821];
-}
-
 async function connectWhatsApp() {
-  if (connectionStatus === STATUS.CONNECTED && sock) return sock;
+  if (connectionStatus === STATUS.CONNECTED && client) return client;
   if (connectPromise) return connectPromise;
 
-  connectPromise = openSocket()
+  connectPromise = openClient()
     .catch((err) => {
-      console.error('[wa] openSocket error:', err.message);
+      console.error('[wa] openClient error:', err.message);
       connectionStatus = STATUS.DISCONNECTED;
-      scheduleReconnect(5000);
       throw err;
     })
     .finally(() => {
@@ -207,147 +142,98 @@ async function connectWhatsApp() {
   return connectPromise;
 }
 
-async function openSocket() {
-  if (sock) {
-    await disconnectSocket();
-    await sleep(500);
+async function openClient() {
+  if (initializing) {
+    await sleep(1000);
+    if (client) return client;
   }
+  initializing = true;
 
-  const baileysMod = await import('@whiskeysockets/baileys');
-  const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    DisconnectReason,
-    makeCacheableSignalKeyStore,
-    Browsers,
-  } = baileysMod;
+  try {
+    await destroyClient();
 
-  fs.mkdirSync(AUTH_DIR, { recursive: true });
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    const { Client, LocalAuth } = require('whatsapp-web.js');
 
-  const version = await resolveWaVersion(baileysMod);
+    fs.mkdirSync(AUTH_DIR, { recursive: true });
 
-  // Use a real desktop browser fingerprint (custom labels often fail companion_hello)
-  const browser =
-    typeof Browsers?.macOS === 'function'
-      ? Browsers.macOS('Desktop')
-      : typeof Browsers?.ubuntu === 'function'
-        ? Browsers.ubuntu('Chrome')
-        : ['Mac OS', 'Chrome', '14.4.1'];
+    const chromePath = resolveChromePath();
+    console.log('[wa] Starting whatsapp-web.js', chromePath ? `chrome=${chromePath}` : '(default chrome)');
 
-  const socketConfig = {
-    version,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
-    },
-    logger,
-    browser,
-    syncFullHistory: false,
-    markOnlineOnConnect: false,
-    generateHighQualityLinkPreview: false,
-    connectTimeoutMs: 60_000,
-    defaultQueryTimeoutMs: 60_000,
-    keepAliveIntervalMs: 30_000,
-    qrTimeout: 60_000,
-    getMessage: async () => undefined,
-  };
+    const puppeteerOpts = {
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-extensions',
+      ],
+    };
+    if (chromePath) {
+      puppeteerOpts.executablePath = chromePath;
+    }
 
-  console.log('[wa] opening socket browser=', JSON.stringify(browser), 'version=', version?.join?.('.') || version);
+    const c = new Client({
+      authStrategy: new LocalAuth({ dataPath: AUTH_DIR }),
+      puppeteer: puppeteerOpts,
+      qrMaxRetries: 10,
+    });
 
-  const socket = makeWASocket(socketConfig);
-  sock = socket;
+    client = c;
 
-  socket.ev.on('creds.update', saveCreds);
-
-  socket.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr, isNewLogin } = update;
-
-    if (qr) {
+    c.on('qr', (qr) => {
       latestQR = qr;
       connectionStatus = STATUS.NEED_QR;
-      console.log('[wa] QR ready — open /qr and scan within ~60s (Linked devices → Link a device)');
-    }
+      console.log('[wa] QR ready — open /qr and scan (Linked devices → Link a device)');
+    });
 
-    if (isNewLogin) {
-      console.log('[wa] isNewLogin=true (pairing progressing)');
-    }
+    c.on('authenticated', () => {
+      console.log('[wa] Authenticated (session saved)');
+    });
 
-    if (connection === 'open') {
+    c.on('ready', () => {
       latestQR = '';
-      latestPairingCode = '';
       connectionStatus = STATUS.CONNECTED;
-      clearReconnectTimer();
-      console.log('[wa] CONNECTED');
-    }
+      console.log('[wa] CONNECTED (whatsapp-web.js ready)');
+    });
 
-    if (connection === 'close') {
-      if (intentionalClose) return;
-
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const errMsg = lastDisconnect?.error?.message || '';
-      console.log(`[wa] close code=${statusCode} msg=${errMsg}`);
-
+    c.on('auth_failure', (msg) => {
+      console.error('[wa] auth_failure:', msg);
       connectionStatus = STATUS.DISCONNECTED;
-      sock = null;
+      latestQR = '';
+    });
 
-      const loggedOut =
-        statusCode === DisconnectReason.loggedOut ||
-        statusCode === 401 ||
-        statusCode === 403;
+    c.on('disconnected', (reason) => {
+      console.log('[wa] disconnected:', reason);
+      connectionStatus = STATUS.DISCONNECTED;
+      latestQR = '';
+      // Auto-reinit after short delay (unless intentional destroy)
+      setTimeout(() => {
+        if (connectionStatus !== STATUS.CONNECTED) {
+          connectWhatsApp().catch((e) => console.error('[wa] reconnect failed:', e.message));
+        }
+      }, 4000);
+    });
 
-      const restartRequired =
-        statusCode === DisconnectReason.restartRequired || statusCode === 515;
+    c.on('loading_screen', (percent, message) => {
+      console.log(`[wa] loading ${percent}% ${message || ''}`);
+    });
 
-      if (loggedOut) {
-        latestQR = '';
-        latestPairingCode = '';
-        clearAuthFolder();
-        scheduleReconnect(1500);
-        return;
-      }
-
-      if (restartRequired) {
-        // Expected right after successful QR pair — reconnect with same auth folder
-        console.log('[wa] restartRequired (515) — reconnecting with saved creds');
-        scheduleReconnect(1200);
-        return;
-      }
-
-      scheduleReconnect(3000);
-    }
-  });
-
-  return socket;
+    await c.initialize();
+    return c;
+  } finally {
+    initializing = false;
+  }
 }
 
-/**
- * Alternative to QR: 8-digit pairing code (Linked devices → Link with phone number).
- * phone: digits only with country code, e.g. 9198XXXXXXXX
- */
-async function requestPairingCode(phone) {
-  const digits = String(phone || '').replace(/\D/g, '');
-  if (digits.length < 10) {
-    const error = new Error('Phone with country code required, e.g. 919876543210');
-    error.statusCode = 400;
-    throw error;
-  }
-
-  if (!sock) {
-    await connectWhatsApp();
-    await sleep(2000);
-  }
-  if (!sock || typeof sock.requestPairingCode !== 'function') {
-    const error = new Error('WhatsApp socket not ready for pairing code');
-    error.statusCode = 503;
-    throw error;
-  }
-
-  const code = await sock.requestPairingCode(digits);
-  latestPairingCode = code;
-  connectionStatus = STATUS.NEED_QR;
-  console.log('[wa] pairing code:', code);
-  return code;
+async function requestPairingCode(_phone) {
+  const error = new Error(
+    'Pairing code is not used with whatsapp-web.js. Open /qr and scan the QR code instead.'
+  );
+  error.statusCode = 400;
+  throw error;
 }
 
 function formatPhoneNumber(phoneNumber) {
@@ -369,29 +255,47 @@ function formatPhoneNumber(phoneNumber) {
   return digits;
 }
 
+function toChatId(digits) {
+  return `${digits}@c.us`;
+}
+
 async function checkNumberStatus(phoneNumber) {
   return enqueue(() => lookupNumber(phoneNumber));
 }
 
 async function lookupNumber(phoneNumber) {
-  if (connectionStatus !== STATUS.CONNECTED || !sock) {
+  if (connectionStatus !== STATUS.CONNECTED || !client) {
     const error = new Error('WhatsApp is not connected');
     error.statusCode = 503;
     throw error;
   }
 
   const normalized = formatPhoneNumber(phoneNumber);
-  const results = await sock.onWhatsApp(normalized);
-  const match = Array.isArray(results) ? results.find((item) => item?.exists) : null;
+  const chatId = toChatId(normalized);
+
+  let exists = false;
+  try {
+    // Prefer isRegisteredUser when available
+    if (typeof client.isRegisteredUser === 'function') {
+      exists = Boolean(await client.isRegisteredUser(chatId));
+    } else {
+      const numberId = await client.getNumberId(chatId);
+      exists = Boolean(numberId);
+    }
+  } catch (err) {
+    // Some accounts return false / throw for invalid — treat as not registered
+    console.warn('[wa] number check failed for', normalized, err.message);
+    exists = false;
+  }
 
   return {
     phoneNumber: normalized,
-    exists: Boolean(match?.exists),
-    jid: match?.jid ?? null,
+    exists,
+    jid: exists ? chatId : null,
   };
 }
 
-async function checkBulkNumbers(numbersArray, delayMs = 1500, onProgress) {
+async function checkBulkNumbers(numbersArray, delayMs = 1200, onProgress) {
   if (!Array.isArray(numbersArray)) {
     const error = new Error('numbersArray must be an array');
     error.statusCode = 400;

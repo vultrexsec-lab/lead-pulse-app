@@ -1,7 +1,7 @@
 node_modules/
 .env
-uploads/*
-!uploads/.gitkeep
-auth_info_baileys/*
-!auth_info_baileys/.gitkeep
-database/scanned_numbers.json
+auth_info_baileys/
+auth_info_wwebjs/
+.wwebjs_auth/
+.wwebjs_cache/
+uploads/
