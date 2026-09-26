@@ -17,6 +17,8 @@ const whatsappRoutes = require('./routes/whatsappRoutes');
 const scraperRoutes = require('./routes/scraperRoutes');
 const processRoutes = require('./routes/processRoutes');
 const whatsappService = require('./services/whatsappService');
+try { require('./scripts/patch-baileys-pairing').ensurePatched(); } catch (e) { console.warn('[wa] patch', e.message); }
+
 
 const app = express();
 const PORT = process.env.PORT || 5000;
