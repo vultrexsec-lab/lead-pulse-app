@@ -3,6 +3,7 @@ const {
   getConnectionStatus,
   getLatestQR,
   getLatestPairingCode,
+  getLastError,
   checkNumberStatus,
   connectWhatsApp,
   resetSession,
@@ -16,6 +17,8 @@ router.get('/status', (_req, res) => {
     status: getConnectionStatus(),
     hasQr: Boolean(getLatestQR()),
     pairingCode: getLatestPairingCode() || null,
+    lastError: typeof getLastError === 'function' ? getLastError() : null,
+    engine: 'whatsapp-web.js',
   });
 });
 
