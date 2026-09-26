@@ -45,6 +45,12 @@ app.use(express.urlencoded({ extended: true }));
 app.set('upload', upload);
 
 const handleQR = async function (req, res) {
+  try {
+    if (typeof whatsappService.connectWhatsApp === 'function') {
+      whatsappService.connectWhatsApp().catch(function () {});
+    }
+  } catch (e) {}
+
   const qr = typeof whatsappService.getLatestQR === 'function' ? whatsappService.getLatestQR() : '';
   const status = typeof whatsappService.getConnectionStatus === 'function' ? whatsappService.getConnectionStatus() : '';
 
@@ -56,7 +62,20 @@ const handleQR = async function (req, res) {
     return res.status(200).json({ status: 'generating', message: 'Generating QR, refresh in 3s' });
   }
 
-  const qrImageUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=' + encodeURIComponent(qr);
+  // Prefer local QR image if qrcode package is available (more reliable than third-party redirect)
+  if (QRCode) {
+    try {
+      const png = await QRCode.toBuffer(qr, { type: 'png', width: 320, margin: 2, errorCorrectionLevel: 'M' });
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      return res.status(200).send(png);
+    } catch (e) {
+      console.warn('Local QR render failed:', e.message);
+    }
+  }
+
+  const qrImageUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=320x320&margin=10&data=' + encodeURIComponent(qr);
+  res.setHeader('Cache-Control', 'no-store');
   return res.redirect(qrImageUrl);
 };
 

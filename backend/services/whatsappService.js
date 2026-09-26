@@ -15,6 +15,10 @@ let connectionStatus = STATUS.DISCONNECTED;
 let connectPromise = null;
 let checkQueue = Promise.resolve();
 let latestQR = '';
+let reconnectTimer = null;
+let intentionalClose = false;
+
+const logger = pino({ level: process.env.WA_LOG_LEVEL || 'silent' });
 
 function getConnectionStatus() {
   return connectionStatus;
@@ -38,52 +42,135 @@ function clearAuthFolder() {
   try {
     if (fs.existsSync(AUTH_DIR)) {
       fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-      console.log('Cleared session directory');
+      console.log('[wa] Cleared session directory');
     }
   } catch (err) {
-    console.error('Auth dir cleanup error:', err.message);
+    console.error('[wa] Auth dir cleanup error:', err.message);
   }
 }
 
+function clearReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function scheduleReconnect(delayMs = 2500) {
+  clearReconnectTimer();
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectWhatsApp().catch((err) => console.error('[wa] Reconnect failed:', err.message));
+  }, delayMs);
+}
+
+async function disconnectSocket() {
+  intentionalClose = true;
+  clearReconnectTimer();
+  try {
+    if (sock) {
+      sock.ev.removeAllListeners('connection.update');
+      sock.ev.removeAllListeners('creds.update');
+      try {
+        sock.end(undefined);
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore
+  }
+  sock = null;
+  intentionalClose = false;
+}
+
+/**
+ * Force a clean new QR session (fixes "Couldn't link device" after bad pairing).
+ */
+async function resetSession() {
+  console.log('[wa] Resetting WhatsApp session...');
+  await disconnectSocket();
+  clearAuthFolder();
+  latestQR = '';
+  connectionStatus = STATUS.DISCONNECTED;
+  await sleep(500);
+  await connectWhatsApp();
+  return { status: connectionStatus, hasQr: Boolean(latestQR) };
+}
+
 async function connectWhatsApp() {
-  if (connectionStatus === STATUS.CONNECTED && sock) return;
+  if (connectionStatus === STATUS.CONNECTED && sock) return sock;
   if (connectPromise) return connectPromise;
 
-  connectPromise = openSocket().finally(() => {
-    connectPromise = null;
-  });
+  connectPromise = openSocket()
+    .catch((err) => {
+      console.error('[wa] openSocket error:', err.message);
+      connectionStatus = STATUS.DISCONNECTED;
+      scheduleReconnect(4000);
+      throw err;
+    })
+    .finally(() => {
+      connectPromise = null;
+    });
 
   return connectPromise;
 }
 
 async function openSocket() {
+  // Close any previous socket before opening a new one (prevents dual-session link failures)
+  if (sock) {
+    await disconnectSocket();
+    await sleep(400);
+  }
+
   const {
     default: makeWASocket,
     useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
+    makeCacheableSignalKeyStore,
+    Browsers,
   } = await import('@whiskeysockets/baileys');
 
   fs.mkdirSync(AUTH_DIR, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
+  let version;
+  try {
+    const latest = await fetchLatestBaileysVersion();
+    version = latest.version;
+    console.log('[wa] Using WA version', version?.join?.('.') || version);
+  } catch (error) {
+    console.warn('[wa] fetchLatestBaileysVersion failed:', error.message);
+  }
+
+  // Desktop-like browser identity — mobile-like strings often cause "Couldn't link device"
+  const browser =
+    typeof Browsers?.ubuntu === 'function'
+      ? Browsers.ubuntu('Chrome')
+      : ['Ubuntu', 'Chrome', '22.04.4'];
+
   const socketConfig = {
-    auth: state,
-    logger: pino({ level: 'silent' }),
-    browser: ['Ubuntu', 'Chrome', '110.0.5563.146'],
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger),
+    },
+    logger,
+    browser,
     syncFullHistory: false,
     markOnlineOnConnect: false,
-    connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 60000,
-    keepAliveIntervalMs: 25000,
+    generateHighQualityLinkPreview: false,
+    connectTimeoutMs: 60_000,
+    defaultQueryTimeoutMs: 60_000,
+    keepAliveIntervalMs: 25_000,
+    qrTimeout: 60_000,
+    printQRInTerminal: false,
+    getMessage: async () => undefined,
   };
 
-  try {
-    const { version } = await fetchLatestBaileysVersion();
+  if (version) {
     socketConfig.version = version;
-  } catch (error) {
-    console.warn('Using bundled Baileys version:', error.message);
   }
 
   const socket = makeWASocket(socketConfig);
@@ -92,38 +179,75 @@ async function openSocket() {
   socket.ev.on('creds.update', saveCreds);
 
   socket.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    const { connection, lastDisconnect, qr, isNewLogin } = update;
 
     if (qr) {
       latestQR = qr;
       connectionStatus = STATUS.NEED_QR;
-      console.log('New WhatsApp QR code generated.');
+      console.log('[wa] New QR generated — scan within ~60s (Linked Devices → Link a device)');
+    }
+
+    if (isNewLogin) {
+      console.log('[wa] New login detected after QR scan');
     }
 
     if (connection === 'open') {
       latestQR = '';
       connectionStatus = STATUS.CONNECTED;
-      console.log('WhatsApp connected successfully!');
+      clearReconnectTimer();
+      console.log('[wa] WhatsApp connected successfully');
+    }
+
+    if (connection === 'connecting') {
+      console.log('[wa] Connecting...');
     }
 
     if (connection === 'close') {
-      latestQR = '';
+      if (intentionalClose) {
+        return;
+      }
+
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const errMsg = lastDisconnect?.error?.message || '';
+      console.log(`[wa] Disconnected code=${statusCode} msg=${errMsg}`);
+
       connectionStatus = STATUS.DISCONNECTED;
       sock = null;
 
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      console.log(`WhatsApp disconnected with status code: ${statusCode}`);
+      // 401 / loggedOut → bad session, must clear and show new QR
+      // 515 → restart required right after successful pairing (do NOT clear auth)
+      // 440 → conflict / replaced
+      // 408 / 428 → timeout
 
-      if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403) {
-        console.log('Invalid session, clearing auth folder...');
+      const loggedOut =
+        statusCode === DisconnectReason.loggedOut ||
+        statusCode === 401 ||
+        statusCode === 403;
+
+      const restartRequired =
+        statusCode === DisconnectReason.restartRequired ||
+        statusCode === 515;
+
+      if (loggedOut) {
+        latestQR = '';
         clearAuthFolder();
+        scheduleReconnect(1500);
+        return;
       }
 
-      setTimeout(() => {
-        connectWhatsApp().catch((err) => console.error('Reconnect failed:', err.message));
-      }, 3000);
+      if (restartRequired) {
+        // Pairing succeeded — reopen with saved creds (do not wipe auth)
+        console.log('[wa] Restart required after link — reconnecting with saved session');
+        scheduleReconnect(1000);
+        return;
+      }
+
+      // Keep existing QR if still valid; reconnect for a fresh one if needed
+      scheduleReconnect(3000);
     }
   });
+
+  return socket;
 }
 
 function formatPhoneNumber(phoneNumber) {
@@ -131,12 +255,9 @@ function formatPhoneNumber(phoneNumber) {
   if (digits.startsWith('00')) digits = digits.slice(2);
   if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
 
-  // Prefer already-international numbers. Only fill missing country code for known local shapes.
-  // Greek mobile 69xxxxxxxx / landline 2xxxxxxxxx → 30
   if (digits.length === 10 && /^(69|2)\d{8}$/.test(digits)) {
     digits = `30${digits}`;
   } else if (digits.length === 10 && /^[6-9]/.test(digits)) {
-    // Classic Indian mobile fallback
     digits = `91${digits}`;
   }
 
@@ -198,6 +319,7 @@ module.exports = {
   getConnectionStatus,
   getLatestQR,
   connectWhatsApp,
+  resetSession,
   formatPhoneNumber,
   checkNumberStatus,
   checkBulkNumbers,
