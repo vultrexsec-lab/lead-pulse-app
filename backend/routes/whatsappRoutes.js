@@ -2,9 +2,11 @@ const express = require('express');
 const {
   getConnectionStatus,
   getLatestQR,
+  getLatestPairingCode,
   checkNumberStatus,
   connectWhatsApp,
   resetSession,
+  requestPairingCode,
 } = require('../services/whatsappService');
 
 const router = express.Router();
@@ -13,6 +15,7 @@ router.get('/status', (_req, res) => {
   res.json({
     status: getConnectionStatus(),
     hasQr: Boolean(getLatestQR()),
+    pairingCode: getLatestPairingCode() || null,
   });
 });
 
@@ -21,7 +24,7 @@ router.post('/reset', async (_req, res) => {
     const result = await resetSession();
     return res.json({
       status: 'ok',
-      message: 'Session cleared. Scan the new QR code within 60 seconds.',
+      message: 'Session cleared. Open /qr and scan the NEW code within 60 seconds.',
       connection: result.status,
       hasQr: result.hasQr,
     });
@@ -39,11 +42,29 @@ router.post('/connect', async (_req, res) => {
     return res.json({
       status: getConnectionStatus(),
       hasQr: Boolean(getLatestQR()),
+    pairingCode: getLatestPairingCode() || null,
     });
   } catch (error) {
     return res.status(500).json({
       status: 'error',
       message: error.message || 'Failed to connect',
+    });
+  }
+});
+
+router.post('/pairing-code', async (req, res) => {
+  try {
+    const phone = req.body?.phone || req.body?.phoneNumber;
+    const code = await requestPairingCode(phone);
+    return res.json({
+      status: 'ok',
+      pairingCode: code,
+      message: 'In WhatsApp: Linked devices → Link with phone number → enter this code',
+    });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({
+      status: 'error',
+      message: error.message || 'Failed to create pairing code',
     });
   }
 });
