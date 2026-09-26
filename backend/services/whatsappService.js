@@ -131,10 +131,12 @@ function formatPhoneNumber(phoneNumber) {
   if (digits.startsWith('00')) digits = digits.slice(2);
   if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
 
-  // Do NOT force a country code. Preserve whatever international digits we received.
-  // Only as a last resort for classic Indian 10-digit mobiles (start 6-9), prefix 91.
-  // US/Canada 10-digit and other local numbers must already include country code from scraper.
-  if (digits.length === 10 && /^[6-9]/.test(digits)) {
+  // Prefer already-international numbers. Only fill missing country code for known local shapes.
+  // Greek mobile 69xxxxxxxx / landline 2xxxxxxxxx → 30
+  if (digits.length === 10 && /^(69|2)\d{8}$/.test(digits)) {
+    digits = `30${digits}`;
+  } else if (digits.length === 10 && /^[6-9]/.test(digits)) {
+    // Classic Indian mobile fallback
     digits = `91${digits}`;
   }
 

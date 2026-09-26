@@ -5,7 +5,12 @@ const puppeteer = require('puppeteer');
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
-// Broader internal link discovery: path patterns + link text keywords
+// Limits for directory / listing crawls (safety + practical runtime)
+const MAX_LISTING_PAGES = Number(process.env.MAX_LISTING_PAGES || 600);
+const MAX_PROFILE_PAGES = Number(process.env.MAX_PROFILE_PAGES || 12000);
+const PROFILE_CONCURRENCY = Number(process.env.PROFILE_CONCURRENCY || 8);
+const REQUEST_DELAY_MS = Number(process.env.SCRAPE_DELAY_MS || 120);
+
 const INTERNAL_LINK_PATTERNS = [
   /\/contact(?:-us|us)?(?:\/|$|\.)/i,
   /\/about(?:-us|us)?(?:\/|$|\.)/i,
@@ -43,19 +48,16 @@ const LINK_TEXT_KEYWORDS = [
   'directory',
 ];
 
-// Strong international + local phone patterns
 const PHONE_PATTERNS = [
-  // +CC or 00CC followed by number (international)
   /(?:\+|00)[1-9]\d{0,3}[\s.\-()]*\d(?:[\d\s.\-()]{5,18}\d)/g,
-  // (XXX) XXX-XXXX style
   /\(\d{2,5}\)[\s.\-]?\d{2,5}[\s.\-]?\d{2,6}/g,
-  // 0XX-XXX-XXXX local with leading 0
   /\b0\d{1,4}[\s.\-]\d{2,5}[\s.\-]\d{2,6}\b/g,
-  // Indian mobile 10-digit starting 6-9
+  // Greek mobiles 69xxxxxxxx
+  /\b69\d{8}\b/g,
+  // Greek landlines 2xxxxxxxxx
+  /\b2\d{9}\b/g,
   /\b[6-9]\d{9}\b/g,
-  // Indian with spaces/dashes 5+5
   /\b[6-9]\d{4}[\s.\-]?\d{5}\b/g,
-  // Generic 10-15 digit sequences that look like phones (word boundary)
   /\b\d{3}[\s.\-]\d{3}[\s.\-]\d{4}\b/g,
   /\b\d{2,4}[\s.\-]\d{3,4}[\s.\-]\d{3,4}\b/g,
 ];
@@ -87,9 +89,33 @@ const CALLING_CODES = {
   pakistan: '92',
   nepal: '977',
   'sri lanka': '94',
+  greece: '30',
+  gr: '30',
+  hellas: '30',
 };
 
-// Known valid country calling codes (subset, most common)
+// TLD / host → default country calling code for local numbers
+const HOST_COUNTRY_CODES = [
+  [/\.gr$/i, '30'],
+  [/\.in$/i, '91'],
+  [/\.uk$/i, '44'],
+  [/\.co\.uk$/i, '44'],
+  [/\.ae$/i, '971'],
+  [/\.au$/i, '61'],
+  [/\.de$/i, '49'],
+  [/\.fr$/i, '33'],
+  [/\.sg$/i, '65'],
+  [/\.pk$/i, '92'],
+  [/\.bd$/i, '880'],
+  [/\.np$/i, '977'],
+  [/\.lk$/i, '94'],
+  [/\.sa$/i, '966'],
+  [/\.qa$/i, '974'],
+  [/\.kw$/i, '965'],
+  [/\.om$/i, '968'],
+  [/11888\.gr/i, '30'],
+];
+
 const VALID_COUNTRY_CODES = new Set([
   '1', '7', '20', '27', '30', '31', '32', '33', '34', '36', '39', '40', '41', '43', '44', '45',
   '46', '47', '48', '49', '51', '52', '53', '54', '55', '56', '57', '58', '60', '61', '62', '63',
@@ -132,6 +158,10 @@ function cleanText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function assertHttpUrl(value) {
   let parsed;
   try {
@@ -147,13 +177,28 @@ function assertHttpUrl(value) {
   return parsed;
 }
 
+function countryCodeFromHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  for (const [re, code] of HOST_COUNTRY_CODES) {
+    if (re.test(host)) return code;
+  }
+  return null;
+}
+
+function startsWithValidCountryCode(digits) {
+  for (const len of [1, 2, 3]) {
+    if (digits.length > len && VALID_COUNTRY_CODES.has(digits.slice(0, len))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
- * Normalize a raw phone string into digits-only international form.
- * - Preserves country code when present (+ or 00 or known length).
- * - Does NOT force India (+91) or any other country.
- * - Returns null for invalid / junk numbers.
+ * Normalize raw phone → digits only, preserving international codes when present.
+ * Optional defaultCountryCode applied only to clearly local numbers.
  */
-function normalizePhone(raw) {
+function normalizePhone(raw, defaultCountryCode = null) {
   const source = String(raw || '').trim();
   if (!source) return null;
 
@@ -164,34 +209,41 @@ function normalizePhone(raw) {
     digits = digits.slice(2);
   }
 
-  // Leading trunk 0 for local numbers (e.g. 09876... -> 9876...)
   if (!hadPlusOr00 && digits.length >= 11 && digits.startsWith('0')) {
     digits = digits.slice(1);
   }
 
   if (digits.length < 8 || digits.length > 15) return null;
-  if (/^(\d)\1{7,}$/.test(digits)) return null; // all same digit
+  if (/^(\d)\1{7,}$/.test(digits)) return null;
 
-  // If original had international indicator, keep full digits as-is
   if (hadPlusOr00) {
-    // Must start with a plausible country code
     if (!startsWithValidCountryCode(digits)) return null;
     return digits;
   }
 
-  // No explicit country code in source.
-  // Accept common local shapes:
-  // - 10 digits (many countries)
-  // - 11 digits starting with country-like prefix already present in digits
-  if (digits.length === 10) {
-    return digits;
-  }
-
+  // Already international length with valid CC
   if (digits.length >= 11 && startsWithValidCountryCode(digits)) {
     return digits;
   }
 
-  // 8-9 digit local (some countries) — keep if looks phone-like
+  // Local number — apply default country code when known
+  if (defaultCountryCode && !digits.startsWith(defaultCountryCode)) {
+    // Greece: 10-digit mobiles 69... or landlines 2...
+    if (defaultCountryCode === '30' && digits.length === 10 && /^(69|2)\d{8}$/.test(digits)) {
+      return `30${digits}`;
+    }
+    // India: 10-digit starting 6-9
+    if (defaultCountryCode === '91' && digits.length === 10 && /^[6-9]/.test(digits)) {
+      return `91${digits}`;
+    }
+    // Generic: 8–10 digit local
+    if (digits.length >= 8 && digits.length <= 10) {
+      return `${defaultCountryCode}${digits}`;
+    }
+  }
+
+  if (digits.length === 10) return digits;
+
   if (digits.length >= 8 && digits.length <= 9) {
     const hasPhoneShape = /[+\-().\s]/.test(source);
     if (hasPhoneShape) return digits;
@@ -200,34 +252,15 @@ function normalizePhone(raw) {
   return null;
 }
 
-function startsWithValidCountryCode(digits) {
-  // Try 1, 2, 3 digit codes
-  for (const len of [1, 2, 3]) {
-    if (digits.length > len && VALID_COUNTRY_CODES.has(digits.slice(0, len))) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Apply country code ONLY as fallback for clearly local numbers
- * during keyword+country search. Never override an existing country code.
- */
 function applyCountryCode(number, country) {
   if (!number) return number;
   const code = CALLING_CODES[cleanText(country).toLowerCase()];
   if (!code) return number;
-
-  // Already has this or another country code
   if (number.startsWith(code)) return number;
   if (startsWithValidCountryCode(number) && number.length > 10) return number;
-
-  // Only prefix local-looking numbers
   if (number.length === 10 || number.length === 9 || number.length === 8) {
     return `${code}${number}`;
   }
-
   return number;
 }
 
@@ -288,7 +321,7 @@ function contextName($, element, fallback) {
   if (
     containerText &&
     containerText.length <= 80 &&
-    /[A-Za-z]/.test(containerText) &&
+    /[A-Za-zΑ-Ωα-ω]/.test(containerText) &&
     !/\d{6,}/.test(containerText)
   ) {
     return containerText;
@@ -297,10 +330,7 @@ function contextName($, element, fallback) {
   return fallback;
 }
 
-/**
- * Extract phone numbers from HTML using multiple strategies.
- */
-function extractLeadsFromHtml(html, pageUrl) {
+function extractLeadsFromHtml(html, pageUrl, defaultCountryCode = null) {
   const $ = cheerio.load(html);
   $('script, style, noscript, svg').remove();
 
@@ -309,7 +339,7 @@ function extractLeadsFromHtml(html, pageUrl) {
   const seen = new Set();
 
   const addLead = (raw, name) => {
-    const number = normalizePhone(raw);
+    const number = normalizePhone(raw, defaultCountryCode);
     if (!number || seen.has(number)) return;
     seen.add(number);
     leads.push({
@@ -319,14 +349,12 @@ function extractLeadsFromHtml(html, pageUrl) {
     });
   };
 
-  // 1. tel: links (most reliable)
   $('a[href^="tel:"], a[href^="TEL:"], a[href^="Tel:"]').each((_, element) => {
     const href = $(element).attr('href') || '';
     const raw = decodeURIComponent(href.replace(/^tel:/i, '').split('?')[0].split(';')[0]);
     addLead(raw, contextName($, element, fallbackName));
   });
 
-  // 2. data attributes commonly used for phones
   $('[data-phone], [data-tel], [data-telephone], [data-mobile], [data-contact], [itemprop="telephone"]').each(
     (_, element) => {
       const attrs = ['data-phone', 'data-tel', 'data-telephone', 'data-mobile', 'data-contact', 'content'];
@@ -339,7 +367,6 @@ function extractLeadsFromHtml(html, pageUrl) {
     }
   );
 
-  // 3. JSON-LD structured data
   $('script[type="application/ld+json"]').each((_, element) => {
     try {
       const data = JSON.parse($(element).html() || '{}');
@@ -348,11 +375,10 @@ function extractLeadsFromHtml(html, pageUrl) {
         walkJsonForPhones(item, (phone) => addLead(phone, fallbackName));
       }
     } catch {
-      // ignore invalid JSON-LD
+      // ignore
     }
   });
 
-  // 4. Meta tags
   $('meta[property="og:phone_number"], meta[name="telephone"], meta[name="phone"], meta[itemprop="telephone"]').each(
     (_, element) => {
       const content = $(element).attr('content');
@@ -360,10 +386,8 @@ function extractLeadsFromHtml(html, pageUrl) {
     }
   );
 
-  // 5. Visible body text with regex patterns
   const text = $('body').text();
   for (const pattern of PHONE_PATTERNS) {
-    // Reset lastIndex for global regex
     pattern.lastIndex = 0;
     const matches = text.match(pattern) || [];
     for (const raw of matches) {
@@ -371,9 +395,8 @@ function extractLeadsFromHtml(html, pageUrl) {
     }
   }
 
-  // 6. Also scan entire HTML source for tel: and phone-like strings that cheerio text may miss
   const htmlSource = String(html || '');
-  const telMatches = htmlSource.match(/tel:[\s]*[+0-9()\-.\s]{8,20}/gi) || [];
+  const telMatches = htmlSource.match(/tel:[\s]*[+0-9()\-.\s]{8,22}/gi) || [];
   for (const m of telMatches) {
     addLead(m.replace(/^tel:\s*/i, ''), fallbackName);
   }
@@ -443,7 +466,6 @@ function discoverInternalLinks(html, pageUrl) {
     }
   });
 
-  // Also check footer/nav areas more aggressively for any internal links with short paths
   $('footer a[href], nav a[href], header a[href], [role="navigation"] a[href]').each((_, element) => {
     const href = $(element).attr('href');
     if (!href || href.startsWith('#') || href.startsWith('mailto:') || href.startsWith('tel:')) return;
@@ -472,6 +494,123 @@ function discoverInternalLinks(html, pageUrl) {
   return [...links].slice(0, 12);
 }
 
+/**
+ * Detect directory / white-pages style listing pages.
+ */
+function isListingPage(html, pageUrl) {
+  const url = String(pageUrl || '').toLowerCase();
+  if (/11888\.gr\/white-pages/i.test(url)) return true;
+  if (/white-?pages|yellow-?pages|directory|katalog|phonebook|people\/search/i.test(url)) {
+    return true;
+  }
+
+  const $ = cheerio.load(html || '');
+  const profileLinks = new Set();
+  $('a[href]').each((_, el) => {
+    const href = $(el).attr('href') || '';
+    if (/\/white-pages\/\d+/i.test(href)) profileLinks.add(href);
+    if (/\/(profile|person|listing|detail)\/[\w-]+/i.test(href)) profileLinks.add(href);
+  });
+
+  // Pagination signals
+  const hasPageParam =
+    /[?&]page=\d+/i.test(html) ||
+    /hx-get=["'][^"']*[?&]page=\d+/i.test(html) ||
+    $('button.paginator-btn, .pagination a, .paginator a, nav[aria-label*="page" i]').length > 0;
+
+  return profileLinks.size >= 5 || (profileLinks.size >= 3 && hasPageParam);
+}
+
+/**
+ * Collect profile detail URLs from a listing HTML.
+ */
+function extractProfileLinks(html, pageUrl) {
+  const $ = cheerio.load(html || '');
+  const origin = new URL(pageUrl);
+  const links = new Set();
+
+  $('a[href]').each((_, el) => {
+    const href = $(el).attr('href');
+    if (!href) return;
+    let resolved;
+    try {
+      resolved = new URL(href, origin);
+    } catch {
+      return;
+    }
+    if (resolved.origin !== origin.origin) return;
+    resolved.hash = '';
+    const path = resolved.pathname || '';
+    // 11888.gr profiles
+    if (/\/white-pages\/\d+\/?$/i.test(path)) {
+      links.add(resolved.href.replace(/\/?$/, '/'));
+      return;
+    }
+    // generic profile-like paths with numeric or slug id
+    if (/\/(profile|person|people|listing|detail|entry)\/[\w-]+\/?$/i.test(path)) {
+      links.add(resolved.href);
+    }
+  });
+
+  // Also scan raw HTML for 11888 style ids embedded in JSON
+  const re = /\/white-pages\/(\d+)\/?/gi;
+  let m;
+  while ((m = re.exec(String(html || ''))) !== null) {
+    links.add(`${origin.origin}/white-pages/${m[1]}/`);
+  }
+
+  return [...links];
+}
+
+/**
+ * Discover max page number and build page URLs for listing.
+ */
+function buildListingPageUrls(html, pageUrl) {
+  const parsed = new URL(pageUrl);
+  const pages = new Set([parsed.href]);
+
+  // Ensure page=1 base
+  const base = new URL(pageUrl);
+  if (!base.searchParams.has('page')) {
+    base.searchParams.set('page', '1');
+  }
+  pages.add(base.href);
+
+  let maxPage = 1;
+
+  // hx-get="/white-pages/?query=maria&page=11953"
+  const hxPages = String(html || '').matchAll(/[?&]page=(\d+)/gi);
+  for (const match of hxPages) {
+    const n = parseInt(match[1], 10);
+    if (Number.isFinite(n) && n > maxPage) maxPage = n;
+  }
+
+  // pagination buttons text
+  const $ = cheerio.load(html || '');
+  $('button.paginator-btn, .pagination a, .paginator a, a[href*="page="]').each((_, el) => {
+    const text = cleanText($(el).text());
+    const n = parseInt(text, 10);
+    if (Number.isFinite(n) && n > maxPage) maxPage = n;
+    const href = $(el).attr('href') || $(el).attr('hx-get') || '';
+    const pm = href.match(/[?&]page=(\d+)/i);
+    if (pm) {
+      const pn = parseInt(pm[1], 10);
+      if (Number.isFinite(pn) && pn > maxPage) maxPage = pn;
+    }
+  });
+
+  // Cap pages
+  maxPage = Math.min(maxPage, MAX_LISTING_PAGES);
+
+  for (let p = 1; p <= maxPage; p += 1) {
+    const u = new URL(pageUrl);
+    u.searchParams.set('page', String(p));
+    pages.add(u.href);
+  }
+
+  return { pageUrls: [...pages], maxPage };
+}
+
 function looksLikeScriptShell(html) {
   const $ = cheerio.load(html || '');
   $('script, style, noscript').remove();
@@ -481,14 +620,14 @@ function looksLikeScriptShell(html) {
 
 async function fetchWithAxios(url) {
   const response = await axios.get(url, {
-    timeout: 18000,
+    timeout: 20000,
     maxRedirects: 5,
-    maxContentLength: 3 * 1024 * 1024,
+    maxContentLength: 4 * 1024 * 1024,
     responseType: 'text',
     headers: {
       'User-Agent': USER_AGENT,
       Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Language': 'en-US,en,el;q=0.9',
     },
     validateStatus: (status) => status >= 200 && status < 400,
   });
@@ -523,25 +662,24 @@ async function fetchWithPuppeteer(url, browserHolder) {
       page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
     );
 
-    // Scroll to trigger lazy-loaded content
-    await page.evaluate(async () => {
-      await new Promise((resolve) => {
-        let total = 0;
-        const distance = 400;
-        const timer = setInterval(() => {
-          window.scrollBy(0, distance);
-          total += distance;
-          if (total >= document.body.scrollHeight || total > 4000) {
-            clearInterval(timer);
-            resolve();
-          }
-        }, 150);
-      });
-    }).catch(() => undefined);
+    await page
+      .evaluate(async () => {
+        await new Promise((resolve) => {
+          let total = 0;
+          const distance = 400;
+          const timer = setInterval(() => {
+            window.scrollBy(0, distance);
+            total += distance;
+            if (total >= document.body.scrollHeight || total > 4000) {
+              clearInterval(timer);
+              resolve();
+            }
+          }, 120);
+        });
+      })
+      .catch(() => undefined);
 
-    // Small wait for any late content
-    await new Promise((r) => setTimeout(r, 800));
-
+    await sleep(600);
     return await page.content();
   } finally {
     await page.close().catch(() => undefined);
@@ -592,14 +730,117 @@ function dedupeLeads(leads) {
   return [...byNumber.values()];
 }
 
+/**
+ * Map-pool concurrency helper
+ */
+async function mapPool(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let index = 0;
+
+  async function run() {
+    while (index < items.length) {
+      const i = index;
+      index += 1;
+      results[i] = await worker(items[i], i);
+    }
+  }
+
+  const runners = Array.from({ length: Math.min(concurrency, items.length) }, () => run());
+  await Promise.all(runners);
+  return results;
+}
+
+/**
+ * Scrape a directory / white-pages listing: paginate → profiles → phones.
+ */
+async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCode) {
+  const firstHtml = await fetchHtml(startUrl, browserHolder);
+  const { pageUrls, maxPage } = buildListingPageUrls(firstHtml, startUrl);
+
+  console.log(`[scraper] Listing detected. Pages to crawl: ${pageUrls.length} (maxPage=${maxPage})`);
+
+  const profileSet = new Set();
+  const leads = [];
+
+  // Always process first page HTML we already have
+  for (const link of extractProfileLinks(firstHtml, startUrl)) {
+    profileSet.add(link);
+  }
+  leads.push(...extractLeadsFromHtml(firstHtml, startUrl, defaultCountryCode));
+
+  // Remaining listing pages
+  const otherPages = pageUrls.filter((u) => {
+    try {
+      const a = new URL(u);
+      const b = new URL(startUrl);
+      return a.searchParams.get('page') !== (b.searchParams.get('page') || '1') || a.href !== b.href;
+    } catch {
+      return true;
+    }
+  });
+
+  // Skip page=1 duplicate of start
+  const pagesToFetch = otherPages.filter((u) => {
+    const p = new URL(u).searchParams.get('page');
+    return p && p !== '1';
+  });
+
+  let pagesDone = 0;
+  for (const pageUrl of pagesToFetch) {
+    if (profileSet.size >= MAX_PROFILE_PAGES) break;
+    try {
+      const html = await fetchHtml(pageUrl, browserHolder);
+      for (const link of extractProfileLinks(html, pageUrl)) {
+        profileSet.add(link);
+      }
+      leads.push(...extractLeadsFromHtml(html, pageUrl, defaultCountryCode));
+      pagesDone += 1;
+      if (pagesDone % 25 === 0) {
+        console.log(`[scraper] Listing pages: ${pagesDone}/${pagesToFetch.length}, profiles: ${profileSet.size}`);
+      }
+      if (REQUEST_DELAY_MS > 0) await sleep(REQUEST_DELAY_MS);
+    } catch (err) {
+      console.warn(`[scraper] Listing page failed ${pageUrl}: ${err.message}`);
+    }
+  }
+
+  const profiles = [...profileSet].slice(0, MAX_PROFILE_PAGES);
+  console.log(`[scraper] Fetching ${profiles.length} profile pages for phone numbers...`);
+
+  const profileLeads = await mapPool(profiles, PROFILE_CONCURRENCY, async (profileUrl, i) => {
+    try {
+      if (REQUEST_DELAY_MS > 0) await sleep(REQUEST_DELAY_MS * (i % PROFILE_CONCURRENCY));
+      const html = await fetchWithAxios(profileUrl).catch(() => null);
+      if (!html) return [];
+      return extractLeadsFromHtml(html, profileUrl, defaultCountryCode);
+    } catch (err) {
+      console.warn(`[scraper] Profile failed ${profileUrl}: ${err.message}`);
+      return [];
+    }
+  });
+
+  for (const batch of profileLeads) {
+    if (Array.isArray(batch)) leads.push(...batch);
+  }
+
+  console.log(`[scraper] Listing scrape done. Raw leads: ${leads.length}`);
+  return dedupeLeads(leads);
+}
+
 async function scrapeUrl(targetUrl) {
   const parsed = assertHttpUrl(targetUrl);
   const browserHolder = { browser: null };
+  const defaultCountryCode = countryCodeFromHost(parsed.hostname);
   const leads = [];
 
   try {
     const homepage = await fetchHtml(parsed.href, browserHolder);
-    leads.push(...extractLeadsFromHtml(homepage, parsed.href));
+
+    if (isListingPage(homepage, parsed.href)) {
+      return await scrapeListingDirectory(parsed.href, browserHolder, defaultCountryCode);
+    }
+
+    leads.push(...extractLeadsFromHtml(homepage, parsed.href, defaultCountryCode));
 
     const pages = discoverInternalLinks(homepage, parsed.href).filter(
       (link) => link !== parsed.href
@@ -608,7 +849,7 @@ async function scrapeUrl(targetUrl) {
     for (const link of pages) {
       try {
         const html = await fetchHtml(link, browserHolder);
-        leads.push(...extractLeadsFromHtml(html, link));
+        leads.push(...extractLeadsFromHtml(html, link, defaultCountryCode));
       } catch (error) {
         console.warn(`Skipped ${link}: ${error.message}`);
       }
@@ -652,7 +893,8 @@ function isBusinessResultUrl(value) {
 
 function parseSearchResults(html, searchUrl, country) {
   const $ = cheerio.load(html);
-  const leads = extractLeadsFromHtml(html, searchUrl).map((lead) => ({
+  const defaultCode = CALLING_CODES[cleanText(country).toLowerCase()] || null;
+  const leads = extractLeadsFromHtml(html, searchUrl, defaultCode).map((lead) => ({
     ...lead,
     number: applyCountryCode(lead.number, country),
   }));
@@ -702,7 +944,6 @@ async function scrapeByKeywordAndCountry(keyword, country) {
         for (const lead of siteLeads) {
           leads.push({
             name: lead.name === 'Unknown' ? site.name : lead.name,
-            // Only apply country code if the number looks local (no country code yet)
             number: applyCountryCode(lead.number, cleanCountry),
             sourceUrl: lead.sourceUrl || site.url,
           });
@@ -721,7 +962,6 @@ async function scrapeByKeywordAndCountry(keyword, country) {
 module.exports = {
   scrapeUrl,
   scrapeByKeywordAndCountry,
-  // exported for testing
   normalizePhone,
   applyCountryCode,
 };
