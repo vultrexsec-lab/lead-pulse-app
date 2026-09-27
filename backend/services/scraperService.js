@@ -765,7 +765,7 @@ async function mapPool(items, concurrency, worker) {
 /**
  * Scrape a directory / white-pages listing: paginate → profiles → phones.
  */
-async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCode, onProgress = () => {}) {
+async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCode, onProgress = () => {}, options = {}) {
   onProgress({ percent: 6, message: 'Reading listing page...' });
   // Prefer fast axios for listing sites; puppeteer only as fallback inside fetchHtml
   let firstHtml;
@@ -778,9 +778,18 @@ async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCod
     firstHtml = await fetchHtml(startUrl, browserHolder);
   }
 
-  const { pageUrls, maxPage, catalogLast, singlePage } = buildListingPageUrls(firstHtml, startUrl);
+  let listingStartUrl = startUrl;
+  if (options.resumePage && Number(options.resumePage) > 1) {
+    try {
+      const u = new URL(startUrl);
+      u.searchParams.set('page', String(options.resumePage));
+      listingStartUrl = u.href;
+      console.log(`[scraper] Resuming listing from page ${options.resumePage}`);
+    } catch (_) {}
+  }
+  const { pageUrls, maxPage, catalogLast, singlePage } = buildListingPageUrls(firstHtml, listingStartUrl);
   console.log(
-    `[scraper] Listing detected. pages=${pageUrls.length} windowEnd=${maxPage} catalogLast=${catalogLast} singlePage=${singlePage}`
+    `[scraper] Listing detected. pages=${pageUrls.length} windowEnd=${maxPage} catalogLast=${catalogLast} singlePage=${singlePage} resume=${options.resumePage || 1}`
   );
   onProgress({
     percent: 8,
@@ -868,16 +877,44 @@ async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCod
     if (Array.isArray(batch)) leads.push(...batch);
   }
 
-  const deduped = dedupeLeads(leads);
-  console.log(`[scraper] Listing scrape done. Raw=${leads.length} unique=${deduped.length}`);
+  let deduped = dedupeLeads(leads);
+  const known = options.knownNumbers instanceof Set ? options.knownNumbers : null;
+  if (known && known.size) {
+    const before = deduped.length;
+    deduped = deduped.filter((lead) => {
+      const digits = String(lead.number || '').replace(/\D/g, '');
+      return !known.has(digits) && !known.has(lead.number);
+    });
+    console.log(`[scraper] Filtered known numbers: ${before} → ${deduped.length} new`);
+  }
+
+  // persist last listing page for resume
+  let lastPage = 1;
+  try {
+    for (const pageUrl of pageUrls) {
+      const u = new URL(pageUrl);
+      const p = parseInt(u.searchParams.get('page') || '1', 10);
+      if (p > lastPage) lastPage = p;
+    }
+  } catch (_) {}
+
+  if (typeof options.onBatch === 'function' && deduped.length) {
+    try {
+      await options.onBatch(deduped, { lastPage });
+    } catch (e) {
+      console.warn('[scraper] onBatch failed', e.message);
+    }
+  }
+
+  console.log(`[scraper] Listing scrape done. Raw=${leads.length} unique new=${deduped.length}`);
   onProgress({
     percent: 82,
-    message: `Scraped ${deduped.length} unique numbers. Starting WhatsApp checks...`,
+    message: `Scraped ${deduped.length} NEW unique numbers.`,
   });
   return deduped;
 }
 
-async function scrapeUrl(targetUrl, onProgress = () => {}) {
+async function scrapeUrl(targetUrl, onProgress = () => {}, options = {}) {
   const parsed = assertHttpUrl(targetUrl);
   const browserHolder = { browser: null };
   const defaultCountryCode = countryCodeFromHost(parsed.hostname);
@@ -896,7 +933,7 @@ async function scrapeUrl(targetUrl, onProgress = () => {}) {
     }
 
     if (isListingPage(homepage, parsed.href)) {
-      return await scrapeListingDirectory(parsed.href, browserHolder, defaultCountryCode, onProgress);
+      return await scrapeListingDirectory(parsed.href, browserHolder, defaultCountryCode, onProgress, options);
     }
 
     leads.push(...extractLeadsFromHtml(homepage, parsed.href, defaultCountryCode));
@@ -924,7 +961,17 @@ async function scrapeUrl(targetUrl, onProgress = () => {}) {
     await closeBrowser(browserHolder);
   }
 
-  const deduped = dedupeLeads(leads);
+  let deduped = dedupeLeads(leads);
+  const known = options.knownNumbers instanceof Set ? options.knownNumbers : null;
+  if (known && known.size) {
+    deduped = deduped.filter((lead) => {
+      const digits = String(lead.number || '').replace(/\D/g, '');
+      return !known.has(digits) && !known.has(lead.number);
+    });
+  }
+  if (typeof options.onBatch === 'function' && deduped.length) {
+    try { await options.onBatch(deduped, {}); } catch (e) { console.warn(e.message); }
+  }
   onProgress({ percent: 82, message: `Scraped ${deduped.length} unique numbers.` });
   return deduped;
 }

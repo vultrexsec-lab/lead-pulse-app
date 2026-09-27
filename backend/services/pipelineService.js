@@ -45,6 +45,63 @@ const SOURCE_ALIASES = [
 ];
 
 const DATABASE_PATH = path.join(__dirname, '..', 'database', 'scanned_numbers.json');
+const URL_PROGRESS_PATH = path.join(__dirname, '..', 'database', 'url_progress.json');
+
+function readUrlProgress() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(URL_PROGRESS_PATH, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeUrlProgress(data) {
+  fs.mkdirSync(path.dirname(URL_PROGRESS_PATH), { recursive: true });
+  fs.writeFileSync(URL_PROGRESS_PATH, `${JSON.stringify(data, null, 2)}\n`);
+}
+
+function urlProgressKey(url) {
+  try {
+    const u = new URL(url);
+    u.hash = '';
+    u.searchParams.delete('page');
+    return u.href;
+  } catch {
+    return String(url);
+  }
+}
+
+async function getKnownNumbers() {
+  return withDatabase(async (database) => new Set(Object.keys(database)));
+}
+
+async function saveLeadsToDatabase(leads) {
+  if (!leads.length) return 0;
+  const scannedAt = new Date().toISOString();
+  let added = 0;
+  await withDatabase(async (database) => {
+    for (const lead of leads) {
+      let number;
+      try {
+        number = whatsappService.formatPhoneNumber(lead.number);
+      } catch {
+        continue;
+      }
+      if (database[number]) continue;
+      database[number] = {
+        name: lead.name || '',
+        isWhatsApp: lead.isWhatsApp ?? null,
+        whatsappJid: lead.whatsappJid || null,
+        source: lead.source || lead.sourceUrl || '',
+        firstScannedAt: scannedAt,
+      };
+      added += 1;
+    }
+  });
+  return added;
+}
+
 let databaseQueue = Promise.resolve();
 
 function readScannedNumbers() {
@@ -360,22 +417,77 @@ async function processExcelFile(filePath, onProgress = () => {}) {
 
 async function processUrlScrape(url, onProgress = () => {}) {
   onProgress({ percent: 4, message: 'Scraping website pages...' });
-  const leads = await scrapeUrl(url, onProgress);
+
+  const known = await getKnownNumbers();
+  const progressStore = readUrlProgress();
+  const key = urlProgressKey(url);
+  const prev = progressStore[key] || {};
+  const resumePage = Number(prev.lastPage || 0) > 0 ? Number(prev.lastPage) + 1 : null;
+
+  onProgress({
+    percent: 5,
+    message: known.size
+      ? `Skipping ${known.size} numbers already saved` + (resumePage ? ` · resume page ${resumePage}` : '')
+      : 'Fresh scrape',
+  });
+
+  const leads = await scrapeUrl(url, onProgress, {
+    knownNumbers: known,
+    resumePage,
+    onBatch: async (batch, meta) => {
+      await saveLeadsToDatabase(
+        batch.map((lead) => ({
+          name: lead.name,
+          number: lead.number,
+          source: lead.sourceUrl || url,
+          isWhatsApp: null,
+        }))
+      );
+      if (meta && meta.lastPage) {
+        progressStore[key] = {
+          ...(progressStore[key] || {}),
+          lastPage: meta.lastPage,
+          updatedAt: new Date().toISOString(),
+          url,
+        };
+        writeUrlProgress(progressStore);
+      }
+    },
+  });
+
   const normalized = leads.map((lead) => ({
     name: lead.name,
     number: lead.number,
     source: lead.sourceUrl || url,
   }));
-  if (!normalized.length) {
-    onProgress({ percent: 100, message: 'No phone numbers found on this URL' });
-    const file = await generateExcel([], `url-leads-${Date.now()}.xlsx`);
-    return summarize([], file, 0);
+
+  if (normalized.length) {
+    progressStore[key] = {
+      ...(progressStore[key] || {}),
+      lastPage: Math.max(Number(prev.lastPage || 0), Number(progressStore[key]?.lastPage || 0)),
+      totalSaved: (Number(prev.totalSaved || 0) || 0) + normalized.length,
+      updatedAt: new Date().toISOString(),
+      url,
+    };
+    writeUrlProgress(progressStore);
   }
-  onProgress({ percent: 84, message: `Scraped ${normalized.length} numbers. Verifying WhatsApp...` });
+
+  if (!normalized.length) {
+    onProgress({
+      percent: 100,
+      message: known.size
+        ? 'No NEW numbers this pass (already scraped). Resume will try later pages next time.'
+        : 'No phone numbers found on this URL',
+    });
+    const file = await generateExcel([], `url-leads-${Date.now()}.xlsx`);
+    return summarize([], file, known.size);
+  }
+
+  onProgress({ percent: 84, message: `Scraped ${normalized.length} NEW numbers. Finalizing...` });
   const { rows, duplicatesRemoved } = await enrichWithWhatsApp(normalized, onProgress);
   onProgress({ percent: 96, message: 'Building Excel sheet...' });
   const file = await generateExcel(rows, `url-leads-${Date.now()}.xlsx`);
-  onProgress({ percent: 100, message: 'Verification complete' });
+  onProgress({ percent: 100, message: 'Extraction complete' });
   return summarize(rows, file, duplicatesRemoved);
 }
 

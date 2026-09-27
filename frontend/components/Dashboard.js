@@ -102,41 +102,66 @@ export default function Dashboard() {
     setStats(EMPTY_STATS);
     setProgress({ percent: 2, message: "Starting extraction..." });
 
+    let stopPoll = false;
     const poll = setInterval(async () => {
+      if (stopPoll) return;
       try {
-        const { data } = await axios.get(`${API_BASE}/api/process/progress/${processId}`);
-        if (data?.message) setProgress(data);
+        const { data } = await axios.get(`${API_BASE}/api/process/progress/${processId}`, {
+          timeout: 15000,
+        });
+        if (data?.message) setProgress({ percent: data.percent || 0, message: data.message });
       } catch {
-        // The process request still owns the final result.
+        // keep polling
       }
-    }, 400);
+    }, 800);
 
     try {
-      const headers = { "x-process-id": processId };
+      const headers = { "x-progress-id": processId, "x-process-id": processId };
       let response;
 
       if (tab === "file") {
         const form = new FormData();
         form.append("file", file);
+        form.append("progressId", processId);
         response = await axios.post(`${API_BASE}/api/process/file`, form, {
           headers,
-          timeout: 0,
+          timeout: 60000,
         });
       } else if (tab === "url") {
         response = await axios.post(
           `${API_BASE}/api/process/url`,
-          { url: url.trim() },
-          { headers, timeout: 0 }
+          { url: url.trim(), progressId: processId },
+          { headers, timeout: 60000 }
         );
       } else {
         response = await axios.post(
           `${API_BASE}/api/process/keyword`,
-          { keyword: keyword.trim(), country },
-          { headers, timeout: 0 }
+          { keyword: keyword.trim(), country, progressId: processId },
+          { headers, timeout: 60000 }
         );
       }
 
-      const data = response.data;
+      let data = response.data;
+
+      // Async job: poll until done (avoids Render request timeout / Network Error)
+      if (data.async && data.jobId) {
+        const jobId = data.jobId;
+        for (;;) {
+          await new Promise((r) => setTimeout(r, 1000));
+          const { data: job } = await axios.get(`${API_BASE}/api/process/progress/${jobId}`, {
+            timeout: 20000,
+          });
+          if (job?.message) setProgress({ percent: job.percent || 0, message: job.message });
+          if (job?.done) {
+            if (job.error || job.result?.success === false) {
+              throw new Error(job.result?.message || job.message || "Extraction failed");
+            }
+            data = job.result || {};
+            break;
+          }
+        }
+      }
+
       const total = data.total || 0;
       const valid = data.whatsappCount || 0;
       const duplicates = data.duplicatesRemoved || 0;
@@ -148,12 +173,13 @@ export default function Dashboard() {
       });
       setLeads(data.leads || []);
       setDownloadUrl(data.downloadUrl || "");
-      setProgress({ percent: 100, message: "Verification complete" });
+      setProgress({ percent: 100, message: "Extraction complete" });
     } catch (requestError) {
       const message = requestError.response?.data?.message || requestError.message || "Extraction failed";
       setError(message);
       setProgress({ percent: 100, message });
     } finally {
+      stopPoll = true;
       clearInterval(poll);
       setRunning(false);
     }
