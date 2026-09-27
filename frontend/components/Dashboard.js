@@ -180,7 +180,11 @@ export default function Dashboard() {
       setDownloadUrl(data.downloadUrl || "");
       setProgress({ percent: 100, message: "Extraction complete" });
     } catch (requestError) {
-      const message = requestError.response?.data?.message || requestError.message || "Extraction failed";
+      let message = requestError.response?.data?.message || requestError.message || "Extraction failed";
+      if (message === "Network Error" || requestError.code === "ERR_NETWORK") {
+        message =
+          "Network Error — backend unreachable. Set NEXT_PUBLIC_API_URL to your Render backend URL (e.g. https://lead-pulse-app.onrender.com) and redeploy frontend.";
+      }
       setError(message);
       setProgress({ percent: 100, message });
     } finally {

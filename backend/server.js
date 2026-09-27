@@ -41,7 +41,13 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 }
 });
 
-app.use(cors());
+app.use(cors({
+  origin: true,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-progress-id', 'x-process-id'],
+}));
+app.options('*', cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.set('upload', upload);
@@ -110,6 +116,13 @@ const handleQR = async function (req, res) {
   return res.redirect(qrImageUrl);
 };
 
+
+app.get('/health', function (_req, res) {
+  res.json({ ok: true, service: 'lead-pulse-backend', time: new Date().toISOString() });
+});
+app.get('/api/health', function (_req, res) {
+  res.json({ ok: true, service: 'lead-pulse-backend', time: new Date().toISOString() });
+});
 
 app.get('/qr', handleQR);
 app.get('/api/qr', handleQR);

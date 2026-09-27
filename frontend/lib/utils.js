@@ -1,7 +1,12 @@
 import { clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
 
-export const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";
+/**
+ * Backend API base URL.
+ * - Production: set NEXT_PUBLIC_API_URL=https://your-backend.onrender.com
+ * - Or leave empty and use Next.js rewrite proxy (see next.config.mjs)
+ */
+export const API_BASE = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/$/, "");
 
 export function cn(...inputs) {
   return twMerge(clsx(inputs));
