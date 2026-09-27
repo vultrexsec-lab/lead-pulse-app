@@ -217,12 +217,13 @@ async function openBaileys() {
   fs.mkdirSync(AUTH_BAILEYS, { recursive: true });
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_BAILEYS);
   const version = await resolveWaVersion(mod);
+  // Ubuntu/Linux identity — user confirmed WhatsApp history showed Ubuntu when linking worked
   const browser =
-    typeof Browsers?.macOS === 'function'
-      ? Browsers.macOS('Desktop')
-      : ['Mac OS', 'Chrome', '14.4.1'];
+    typeof Browsers?.ubuntu === 'function'
+      ? Browsers.ubuntu('Chrome')
+      : ['Ubuntu', 'Chrome', '22.04.4'];
 
-  console.log('[wa] Baileys start version=', version.join('.'));
+  console.log('[wa] Baileys start version=', version.join('.'), 'browser=', JSON.stringify(browser));
 
   const socket = makeWASocket({
     version,
