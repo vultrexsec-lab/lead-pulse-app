@@ -254,7 +254,25 @@ async function enrichWithWhatsApp(leads, onProgress = () => {}) {
   const { fresh, duplicatesRemoved } = selected;
 
   let checks = [];
-  if (fresh.length > 0) {
+  const skipWa =
+    process.env.SKIP_WHATSAPP === '1' ||
+    process.env.SKIP_WHATSAPP === 'true' ||
+    (typeof whatsappService.getConnectionStatus === 'function' &&
+      whatsappService.getConnectionStatus() !== 'CONNECTED');
+
+  if (fresh.length > 0 && skipWa) {
+    onProgress({
+      percent: 90,
+      message:
+        'WhatsApp not linked — returning numbers without WhatsApp check. Link QR on a local PC (Render cloud IP often blocks pairing).',
+    });
+    checks = fresh.map((lead) => ({
+      phoneNumber: lead.number,
+      exists: null,
+      jid: null,
+      skipped: true,
+    }));
+  } else if (fresh.length > 0) {
     onProgress({
       percent: 12,
       message: `Checking 0/${fresh.length} new numbers...`,

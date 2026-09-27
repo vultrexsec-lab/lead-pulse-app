@@ -706,7 +706,11 @@ export const makeSocket = (config) => {
         const refNodes = getBinaryNodeChildren(pairDeviceNode, 'ref');
         const noiseKeyB64 = Buffer.from(creds.noiseKey.public).toString('base64');
         const identityKeyB64 = Buffer.from(creds.signedIdentityKey.public).toString('base64');
-        const refs = refNodes.map((refNode) => refNode.content.toString('utf-8'));
+        const refs = refNodes.map((refNode) => {
+            const c = refNode.content;
+            if (typeof c === 'string') return c;
+            return Buffer.from(c || []).toString('utf-8');
+        });
         const renderer = makePairingQRRenderer(refs, (ref) => {
             const qr = buildPairingQRData(ref, noiseKeyB64, identityKeyB64, creds.advSecretKey, browser);
             ev.emit('connection.update', { qr });

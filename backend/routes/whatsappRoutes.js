@@ -10,16 +10,26 @@ const {
   resetSession,
   requestPairingCode,
 } = require('../services/whatsappService');
+const { isPatched, findBaileysRoot } = require('../scripts/patch-baileys-pairing');
 
 const router = express.Router();
 
 router.get('/status', (_req, res) => {
+  let pairingFix = false;
+  try {
+    const root = findBaileysRoot();
+    pairingFix = root ? isPatched(root) : false;
+  } catch (_) {}
   res.json({
     status: getConnectionStatus(),
     hasQr: Boolean(getLatestQR()),
     pairingCode: getLatestPairingCode() || null,
     lastError: typeof getLastError === 'function' ? getLastError() : null,
     engine: typeof getEngine === 'function' ? getEngine() : null,
+    pairingFix,
+    hint: pairingFix
+      ? 'If scan still fails, Render/datacenter IP may be blocked by WhatsApp. Run backend on your PC to link.'
+      : 'Pairing patch not applied — restart with npm start',
   });
 });
 
