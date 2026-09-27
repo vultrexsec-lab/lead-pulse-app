@@ -4,7 +4,7 @@
   "description": "Lead Extractor & WhatsApp Validator API",
   "main": "server.js",
   "scripts": {
-    "start": "node scripts/patch-baileys-pairing.js && node server.js",
+    "start": "node scripts/patch-baileys-pairing.js; node server.js",
     "postinstall": "node scripts/patch-baileys-pairing.js",
     "patch:baileys": "node scripts/patch-baileys-pairing.js"
   },

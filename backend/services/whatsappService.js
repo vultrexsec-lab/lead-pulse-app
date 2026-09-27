@@ -45,8 +45,10 @@ function isRenderLike() {
 function pickEngine() {
   const forced = String(process.env.WA_ENGINE || '').toLowerCase();
   if (forced === 'baileys' || forced === 'wwebjs') return forced;
-  // Default Baileys everywhere — no Chrome needed; pairing patch required for QR link
-  return 'baileys';
+  // Local PC: real Chrome (same as web.whatsapp.com) — Baileys QR often fails even on residential
+  // Render/cloud: no Chrome → Baileys
+  if (isRenderLike()) return 'baileys';
+  return 'wwebjs';
 }
 
 function getConnectionStatus() {
@@ -386,6 +388,11 @@ async function connectWhatsApp() {
 
   engine = pickEngine();
   console.log('[wa] engine=', engine, 'render=', isRenderLike());
+  if (engine === 'wwebjs') {
+    console.log('[wa] IMPORTANT: Using real Chrome (like web.whatsapp.com). Keep /qr open and scan once.');
+  } else {
+    console.log('[wa] Baileys mode (cloud). If link fails on local, set WA_ENGINE=wwebjs');
+  }
 
   connectPromise = (async () => {
     if (engine === 'wwebjs') return openWwebjs();
