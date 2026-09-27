@@ -745,19 +745,22 @@ function dedupeLeads(leads) {
 /**
  * Map-pool concurrency helper
  */
-async function mapPool(items, concurrency, worker) {
+async function mapPool(items, concurrency, worker, control = null) {
   const results = new Array(items.length);
   let index = 0;
 
   async function run() {
     while (index < items.length) {
+      if (control?.isStopped?.()) break;
+      if (control?.waitWhilePaused) await control.waitWhilePaused();
+      if (control?.isStopped?.()) break;
       const i = index;
       index += 1;
       results[i] = await worker(items[i], i);
     }
   }
 
-  const runners = Array.from({ length: Math.min(concurrency, items.length) }, () => run());
+  const runners = Array.from({ length: Math.min(concurrency, Math.max(items.length, 1)) }, () => run());
   await Promise.all(runners);
   return results;
 }
@@ -815,8 +818,17 @@ async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCod
     }
   })();
 
+  const control = options.control || null;
   let pagesDone = 0;
   for (const pageUrl of pageUrls) {
+    if (control?.isStopped?.()) {
+      onProgress({ percent: 30, message: 'Stopped by user during listing pages...' });
+      break;
+    }
+    if (control?.waitWhilePaused) {
+      await control.waitWhilePaused();
+      if (control?.isStopped?.()) break;
+    }
     if (profileSet.size >= MAX_PROFILE_PAGES) break;
     try {
       const u = new URL(pageUrl);
@@ -853,6 +865,9 @@ async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCod
 
   let profilesDone = 0;
   const profileLeads = await mapPool(profiles, PROFILE_CONCURRENCY, async (profileUrl) => {
+    if (control?.isStopped?.()) return [];
+    if (control?.waitWhilePaused) await control.waitWhilePaused();
+    if (control?.isStopped?.()) return [];
     try {
       if (REQUEST_DELAY_MS > 0) await sleep(REQUEST_DELAY_MS);
       const html = await fetchWithAxios(profileUrl).catch(() => null);
@@ -871,7 +886,7 @@ async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCod
       console.warn(`[scraper] Profile failed ${profileUrl}: ${err.message}`);
       return [];
     }
-  });
+  }, control);
 
   for (const batch of profileLeads) {
     if (Array.isArray(batch)) leads.push(...batch);

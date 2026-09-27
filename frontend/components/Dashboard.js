@@ -53,6 +53,8 @@ export default function Dashboard() {
   const [leads, setLeads] = useState([]);
   const [downloadUrl, setDownloadUrl] = useState("");
   const [error, setError] = useState("");
+  const [jobId, setJobId] = useState("");
+  const [paused, setPaused] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -101,6 +103,8 @@ export default function Dashboard() {
     setLeads([]);
     setStats(EMPTY_STATS);
     setProgress({ percent: 2, message: "Starting extraction..." });
+    setJobId(processId);
+    setPaused(false);
 
     let stopPoll = false;
     const poll = setInterval(async () => {
@@ -146,6 +150,7 @@ export default function Dashboard() {
       // Async job: poll until done (avoids Render request timeout / Network Error)
       if (data.async && data.jobId) {
         const jobId = data.jobId;
+        setJobId(jobId);
         for (;;) {
           await new Promise((r) => setTimeout(r, 1000));
           const { data: job } = await axios.get(`${API_BASE}/api/process/progress/${jobId}`, {
@@ -182,6 +187,22 @@ export default function Dashboard() {
       stopPoll = true;
       clearInterval(poll);
       setRunning(false);
+      setPaused(false);
+    }
+  }
+
+
+  async function controlJob(action) {
+    if (!jobId) return;
+    try {
+      await axios.post(`${API_BASE}/api/process/control/${jobId}`, { action });
+      if (action === "pause") setPaused(true);
+      if (action === "resume") setPaused(false);
+      if (action === "stop") {
+        setProgress((p) => ({ ...p, message: "Stopping — saving numbers..." }));
+      }
+    } catch (e) {
+      setError(e.response?.data?.message || e.message || "Control failed");
     }
   }
 

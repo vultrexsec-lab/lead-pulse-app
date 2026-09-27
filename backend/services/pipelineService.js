@@ -400,7 +400,7 @@ function summarize(rows, file, duplicatesRemoved) {
   };
 }
 
-async function processExcelFile(filePath, onProgress = () => {}) {
+async function processExcelFile(filePath, onProgress = () => {}, control = null) {
   if (!filePath) {
     throw httpError('An Excel or CSV file is required', 400);
   }
@@ -415,7 +415,7 @@ async function processExcelFile(filePath, onProgress = () => {}) {
   return summarize(rows, file, duplicatesRemoved);
 }
 
-async function processUrlScrape(url, onProgress = () => {}) {
+async function processUrlScrape(url, onProgress = () => {}, control = null) {
   onProgress({ percent: 4, message: 'Scraping website pages...' });
 
   const known = await getKnownNumbers();
@@ -434,6 +434,7 @@ async function processUrlScrape(url, onProgress = () => {}) {
   const leads = await scrapeUrl(url, onProgress, {
     knownNumbers: known,
     resumePage,
+    control,
     onBatch: async (batch, meta) => {
       await saveLeadsToDatabase(
         batch.map((lead) => ({
@@ -491,7 +492,7 @@ async function processUrlScrape(url, onProgress = () => {}) {
   return summarize(rows, file, duplicatesRemoved);
 }
 
-async function processKeywordScrape(keyword, country, onProgress = () => {}) {
+async function processKeywordScrape(keyword, country, onProgress = () => {}, control = null) {
   onProgress({ percent: 4, message: 'Searching public business listings...' });
   const leads = await scrapeByKeywordAndCountry(keyword, country);
   const normalized = leads.map((lead) => ({
