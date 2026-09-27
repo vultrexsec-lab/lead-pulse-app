@@ -45,9 +45,8 @@ function isRenderLike() {
 function pickEngine() {
   const forced = String(process.env.WA_ENGINE || '').toLowerCase();
   if (forced === 'baileys' || forced === 'wwebjs') return forced;
-  // Render: Chrome is unreliable → Baileys
-  if (isRenderLike()) return 'baileys';
-  return 'wwebjs';
+  // Default Baileys everywhere — no Chrome needed; pairing patch required for QR link
+  return 'baileys';
 }
 
 function getConnectionStatus() {
@@ -160,6 +159,7 @@ function ensureBaileysPatched() {
     if (typeof patch.ensurePatched === 'function') {
       const ok = patch.ensurePatched();
       console.log('[wa] baileys patch', ok ? 'OK' : 'FAILED');
+      if (!ok) lastError = 'Baileys pairing patch missing — QR scan will fail with Could not link device';
       return ok;
     }
   } catch (e) {

@@ -121,6 +121,43 @@ app.use(function (err, _req, res, _next) {
   return res.status(500).json({ status: 'error', message: 'Internal server error' });
 });
 
+
+app.get('/pair', function (_req, res) {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.end(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp Pair</title>
+  <style>body{font-family:system-ui;background:#0b0f14;color:#e2e8f0;max-width:480px;margin:40px auto;padding:0 16px}
+  input,button{font-size:16px;padding:12px;border-radius:10px;border:1px solid #334155;width:100%;box-sizing:border-box;margin:8px 0}
+  button{background:#25D366;color:#052e16;font-weight:700;border:0;cursor:pointer}
+  code{background:#1e293b;padding:2px 6px;border-radius:4px}
+  #out{margin-top:16px;white-space:pre-wrap;background:#111827;padding:12px;border-radius:10px}
+  a{color:#4ade80}</style></head><body>
+  <h1>WhatsApp link</h1>
+  <p>1) Open <a href="/qr" target="_blank">/qr</a> and scan QR<br>
+  2) Or enter phone with country code for pairing code</p>
+  <input id="phone" placeholder="9198XXXXXXXX" />
+  <button id="go">Get pairing code</button>
+  <button id="reset" style="background:#64748b;color:#fff">Reset session</button>
+  <div id="out"></div>
+  <script>
+  const out = document.getElementById('out');
+  document.getElementById('go').onclick = async () => {
+    const phone = document.getElementById('phone').value.trim();
+    out.textContent = 'Requesting...';
+    try {
+      const r = await fetch('/api/whatsapp/pairing-code', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({phone})});
+      const j = await r.json();
+      out.textContent = JSON.stringify(j, null, 2);
+      if (j.pairingCode) out.textContent = 'Code: ' + j.pairingCode + '\n\nPhone: Linked devices → Link with phone number → enter code';
+    } catch(e) { out.textContent = e.message; }
+  };
+  document.getElementById('reset').onclick = async () => {
+    out.textContent = 'Resetting...';
+    const r = await fetch('/api/whatsapp/reset', {method:'POST'});
+    out.textContent = JSON.stringify(await r.json(), null, 2);
+  };
+  </script></body></html>`);
+});
+
 app.listen(PORT, function () {
   console.log('Backend running on port ' + PORT);
   if (typeof whatsappService.connectWhatsApp === 'function') {
