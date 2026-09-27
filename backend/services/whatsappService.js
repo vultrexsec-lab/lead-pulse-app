@@ -33,6 +33,10 @@ let intentionalClose = false;
 
 const logger = pino({ level: process.env.WA_LOG_LEVEL || 'silent' });
 
+function isWhatsAppEnabled() {
+  return process.env.WHATSAPP_ENABLED === '1' || process.env.WHATSAPP_ENABLED === 'true';
+}
+
 function isRenderLike() {
   return Boolean(
     process.env.RENDER ||
@@ -382,6 +386,13 @@ async function openWwebjs() {
 // ── Public ───────────────────────────────────────────────────────────────────
 
 async function connectWhatsApp() {
+  if (!isWhatsAppEnabled()) {
+    connectionStatus = STATUS.DISCONNECTED;
+    latestQR = '';
+    lastError = 'WhatsApp disabled (WHATSAPP_ENABLED not set). Scraping works without it.';
+    console.log('[wa] DISABLED — set WHATSAPP_ENABLED=1 to turn on');
+    return null;
+  }
   if (connectionStatus === STATUS.CONNECTED && (sock || wwebClient)) {
     return sock || wwebClient;
   }
@@ -527,6 +538,7 @@ async function checkBulkNumbers(numbersArray, delayMs = 1200, onProgress) {
 
 module.exports = {
   STATUS,
+  isWhatsAppEnabled,
   getConnectionStatus,
   getLatestQR,
   getLatestPairingCode,

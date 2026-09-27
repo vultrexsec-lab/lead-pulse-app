@@ -5,6 +5,7 @@ const {
   getLatestPairingCode,
   getLastError,
   getEngine,
+  isWhatsAppEnabled,
   checkNumberStatus,
   connectWhatsApp,
   resetSession,
@@ -20,7 +21,16 @@ router.get('/status', (_req, res) => {
     const root = findBaileysRoot();
     pairingFix = root ? isPatched(root) : false;
   } catch (_) {}
+  const enabled = typeof isWhatsAppEnabled === 'function' ? isWhatsAppEnabled() : false;
+  if (!enabled) {
+    return res.json({
+      status: 'DISABLED',
+      whatsappEnabled: false,
+      message: 'WhatsApp OFF — scrape numbers without QR. Set WHATSAPP_ENABLED=1 to enable later.',
+    });
+  }
   res.json({
+    whatsappEnabled: true,
     status: getConnectionStatus(),
     hasQr: Boolean(getLatestQR()),
     pairingCode: getLatestPairingCode() || null,
