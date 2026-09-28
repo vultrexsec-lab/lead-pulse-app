@@ -111,7 +111,7 @@ export default function Dashboard() {
       if (stopPoll) return;
       try {
         const { data } = await axios.get(`${API_BASE}/api/process/progress/${processId}`, {
-          timeout: 15000,
+          timeout: 120000,
         });
         if (data?.message) setProgress({ percent: data.percent || 0, message: data.message });
       } catch {
@@ -129,19 +129,19 @@ export default function Dashboard() {
         form.append("progressId", processId);
         response = await axios.post(`${API_BASE}/api/process/file`, form, {
           headers,
-          timeout: 60000,
+          timeout: 120000,
         });
       } else if (tab === "url") {
         response = await axios.post(
           `${API_BASE}/api/process/url`,
           { url: url.trim(), progressId: processId },
-          { headers, timeout: 60000 }
+          { headers, timeout: 120000 }
         );
       } else {
         response = await axios.post(
           `${API_BASE}/api/process/keyword`,
           { keyword: keyword.trim(), country, progressId: processId },
-          { headers, timeout: 60000 }
+          { headers, timeout: 120000 }
         );
       }
 
@@ -151,18 +151,30 @@ export default function Dashboard() {
       if (data.async && data.jobId) {
         const jobId = data.jobId;
         setJobId(jobId);
-        for (;;) {
-          await new Promise((r) => setTimeout(r, 1000));
-          const { data: job } = await axios.get(`${API_BASE}/api/process/progress/${jobId}`, {
-            timeout: 20000,
-          });
-          if (job?.message) setProgress({ percent: job.percent || 0, message: job.message });
-          if (job?.done) {
-            if (job.error || job.result?.success === false) {
-              throw new Error(job.result?.message || job.message || "Extraction failed");
+        for (let attempt = 0; attempt < 3600; attempt += 1) {
+          await new Promise((r) => setTimeout(r, 1500));
+          try {
+            const { data: job } = await axios.get(`${API_BASE}/api/process/progress/${jobId}`, {
+              timeout: 60000,
+            });
+            if (job?.message) setProgress({ percent: job.percent || 0, message: job.message });
+            if (job?.done) {
+              if (job.error || job.result?.success === false) {
+                throw new Error(job.result?.message || job.message || "Extraction failed");
+              }
+              data = job.result || {};
+              break;
             }
-            data = job.result || {};
-            break;
+          } catch (pollErr) {
+            // Ignore transient timeouts while job still runs on server
+            if (pollErr.message && /timeout/i.test(pollErr.message)) {
+              setProgress((prev) => ({
+                percent: prev.percent || 5,
+                message: "Still working on server... (waiting)",
+              }));
+              continue;
+            }
+            throw pollErr;
           }
         }
       }
