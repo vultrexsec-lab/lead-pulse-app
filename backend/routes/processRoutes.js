@@ -246,6 +246,19 @@ router.post('/control/:id', (req, res) => {
   });
 });
 
+router.post('/reset-scraped', (req, res) => {
+  try {
+    const dbPath = path.join(__dirname, '..', 'database', 'scanned_numbers.json');
+    const progPath = path.join(__dirname, '..', 'database', 'url_progress.json');
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    fs.writeFileSync(dbPath, '{}\n');
+    fs.writeFileSync(progPath, '{}\n');
+    return res.json({ success: true, message: 'Cleared scraped numbers DB and URL resume state' });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 router.get('/progress/:id', (req, res) => {
   const id = String(req.params.id || '').replace(/[^\w-]/g, '').slice(0, 80);
   const job = jobs.get(id);

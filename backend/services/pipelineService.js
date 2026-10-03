@@ -301,13 +301,41 @@ function selectNewLeads(leads, database) {
   return { fresh, duplicatesRemoved };
 }
 
-async function enrichWithWhatsApp(leads, onProgress = () => {}) {
+async function enrichWithWhatsApp(leads, onProgress = () => {}, options = {}) {
   onProgress({
     percent: 8,
-    message: 'Removing previously scanned duplicates...',
+    message: 'Preparing numbers...',
   });
 
-  const selected = await withDatabase(async (database) => selectNewLeads(leads, database));
+  // knownSnapshot = numbers that existed BEFORE this run (mid-run saves must not empty results)
+  let selected;
+  if (options.knownSnapshot instanceof Set) {
+    const seen = new Set();
+    const fresh = [];
+    let duplicatesRemoved = 0;
+    for (const lead of leads) {
+      let number;
+      try {
+        number = whatsappService.formatPhoneNumber(lead.number);
+      } catch {
+        continue;
+      }
+      if (options.knownSnapshot.has(number) || seen.has(number)) {
+        duplicatesRemoved += 1;
+        // Still include in output so UI/Excel show this run's finds
+        if (!seen.has(number)) {
+          seen.add(number);
+          fresh.push({ ...lead, number, _wasDuplicate: true });
+        }
+        continue;
+      }
+      seen.add(number);
+      fresh.push({ ...lead, number, _wasDuplicate: false });
+    }
+    selected = { fresh, duplicatesRemoved };
+  } else {
+    selected = await withDatabase(async (database) => selectNewLeads(leads, database));
+  }
   const { fresh, duplicatesRemoved } = selected;
 
   let checks = [];
@@ -492,12 +520,69 @@ async function processUrlScrape(url, onProgress = () => {}, control = null) {
     return summarize([], file, known.size);
   }
 
-  onProgress({ percent: 84, message: `Scraped ${normalized.length} NEW numbers. Finalizing...` });
-  const { rows, duplicatesRemoved } = await enrichWithWhatsApp(normalized, onProgress);
-  onProgress({ percent: 96, message: 'Building Excel sheet...' });
-  const file = await generateExcel(rows, `url-leads-${Date.now()}.xlsx`);
-  onProgress({ percent: 100, message: 'Extraction complete' });
-  return summarize(rows, file, duplicatesRemoved);
+    onProgress({
+    percent: 84,
+    message: `Scraped ${normalized.length} numbers. Finalizing...`,
+    liveCount: normalized.length,
+    liveLeads: normalized.slice(-100).map((l) => ({
+      name: l.name || '',
+      number: l.number,
+      source: l.source || '',
+      isWhatsApp: null,
+    })),
+  });
+
+  // Use snapshot from START of run so mid-scrape DB saves don't wipe results
+  const { rows, duplicatesRemoved } = await enrichWithWhatsApp(normalized, onProgress, {
+    knownSnapshot: known,
+  });
+
+  // Ensure every number from this run is in the Excel/UI
+  const finalRows =
+    rows.length > 0
+      ? rows
+      : normalized.map((l) => {
+          let number = l.number;
+          try {
+            number = whatsappService.formatPhoneNumber(l.number);
+          } catch {
+            /* keep */
+          }
+          return {
+            name: l.name || '',
+            number,
+            source: l.source || url,
+            isWhatsApp: null,
+            whatsappJid: '',
+          };
+        });
+
+  await saveLeadsToDatabase(finalRows);
+
+  onProgress({
+    percent: 96,
+    message: 'Building Excel sheet...',
+    liveCount: finalRows.length,
+    liveLeads: finalRows.slice(-100).map((r) => ({
+      name: r.name || '',
+      number: r.number,
+      source: r.source || '',
+      isWhatsApp: r.isWhatsApp,
+    })),
+  });
+  const file = await generateExcel(finalRows, `url-leads-${Date.now()}.xlsx`);
+  onProgress({
+    percent: 100,
+    message: control?.isStopped?.() ? 'Stopped — results saved' : 'Extraction complete',
+    liveCount: finalRows.length,
+    liveLeads: finalRows.slice(0, 200).map((r) => ({
+      name: r.name || '',
+      number: r.number,
+      source: r.source || '',
+      isWhatsApp: r.isWhatsApp,
+    })),
+  });
+  return summarize(finalRows, file, duplicatesRemoved);
 }
 
 async function processKeywordScrape(keyword, country, onProgress = () => {}, control = null) {

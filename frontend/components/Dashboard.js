@@ -190,18 +190,26 @@ export default function Dashboard() {
         }
       }
 
-      const total = data.total || 0;
+      const list = Array.isArray(data.leads) && data.leads.length
+        ? data.leads
+        : Array.isArray(data.liveLeads)
+          ? data.liveLeads
+          : [];
+      const total = data.total || list.length || 0;
       const valid = data.whatsappCount || 0;
       const duplicates = data.duplicatesRemoved || 0;
       setStats({
-        scraped: total + duplicates,
+        scraped: total,
         valid,
         invalid: Math.max(total - valid, 0),
         duplicates,
       });
-      setLeads(data.leads || []);
+      setLeads(list);
       setDownloadUrl(data.downloadUrl || "");
-      setProgress({ percent: 100, message: "Extraction complete" });
+      setProgress({
+        percent: 100,
+        message: data.partial ? "Stopped — results saved" : "Extraction complete",
+      });
     } catch (requestError) {
       let message = requestError.response?.data?.message || requestError.message || "Extraction failed";
       if (message === "Network Error" || requestError.code === "ERR_NETWORK") {

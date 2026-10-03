@@ -34,7 +34,9 @@ let intentionalClose = false;
 const logger = pino({ level: process.env.WA_LOG_LEVEL || 'silent' });
 
 function isWhatsAppEnabled() {
-  return process.env.WHATSAPP_ENABLED === '1' || process.env.WHATSAPP_ENABLED === 'true';
+  // ON by default. Set WHATSAPP_ENABLED=0 to disable.
+  const v = String(process.env.WHATSAPP_ENABLED || '1').toLowerCase();
+  return v !== '0' && v !== 'false' && v !== 'off';
 }
 
 function isRenderLike() {

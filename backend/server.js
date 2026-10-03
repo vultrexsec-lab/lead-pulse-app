@@ -53,10 +53,11 @@ app.set('upload', upload);
 
 const handleQR = async function (req, res) {
   try {
-    if (process.env.WHATSAPP_ENABLED !== '1' && process.env.WHATSAPP_ENABLED !== 'true') {
+    const waOff = ['0', 'false', 'off'].includes(String(process.env.WHATSAPP_ENABLED || '1').toLowerCase());
+    if (waOff) {
       return res.status(200).json({
         status: 'disabled',
-        message: 'WhatsApp is temporarily OFF. Scraping works without QR. Set WHATSAPP_ENABLED=1 on Render when you want WhatsApp again.',
+        message: 'WhatsApp OFF (WHATSAPP_ENABLED=0).',
       });
     }
     if (typeof whatsappService.connectWhatsApp === 'function') {
