@@ -2,7 +2,7 @@
 const BACKEND = (
   process.env.BACKEND_URL ||
   process.env.NEXT_PUBLIC_API_URL ||
-  "https://lead-pulse-app.onrender.com"
+  "https://lead-pulse-app-etcf.onrender.com"
 ).replace(/\/$/, "");
 
 const nextConfig = {

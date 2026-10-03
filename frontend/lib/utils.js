@@ -5,7 +5,7 @@ import { twMerge } from "tailwind-merge";
  * Backend API base URL (Render).
  * Override with NEXT_PUBLIC_API_URL if your backend URL is different.
  */
-const DEFAULT_BACKEND = "https://lead-pulse-app.onrender.com";
+const DEFAULT_BACKEND = "https://lead-pulse-app-etcf.onrender.com";
 
 export const API_BASE = (
   process.env.NEXT_PUBLIC_API_URL ||
