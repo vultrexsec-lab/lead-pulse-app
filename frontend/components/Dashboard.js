@@ -447,33 +447,20 @@ export default function Dashboard() {
               <tr>
                 <th className="px-4 py-3 font-medium">Name</th>
                 <th className="px-4 py-3 font-medium">Phone Number</th>
-                <th className="px-4 py-3 font-medium">Source</th>
-                <th className="px-4 py-3 font-medium">WhatsApp Status</th>
               </tr>
             </thead>
             <tbody>
               {leads.length === 0 ? (
                 <tr>
-                  <td colSpan={4} className="px-4 py-8 text-center text-slate-500">
-                    Verified leads will appear here.
+                  <td colSpan={2} className="px-4 py-8 text-center text-slate-500">
+                    Scraped leads will appear here.
                   </td>
                 </tr>
               ) : (
-                leads.map((lead) => (
-                  <tr key={`${lead.number}-${lead.source}`} className="border-t border-white/10">
+                leads.map((lead, index) => (
+                  <tr key={`${lead.number}-${index}`} className="border-t border-white/10">
                     <td className="px-4 py-3">{lead.name || "—"}</td>
                     <td className="px-4 py-3 font-mono">{lead.number}</td>
-                    <td className="max-w-[240px] truncate px-4 py-3 text-slate-300">{lead.source || "—"}</td>
-                    <td className="px-4 py-3">
-                      <span
-                        className={cn(
-                          "rounded-full px-2.5 py-1 text-xs font-semibold",
-                          lead.isWhatsApp ? "bg-[#25D366]/15 text-[#b6f5cd]" : "bg-rose-500/10 text-rose-200"
-                        )}
-                      >
-                        {lead.isWhatsApp ? "Active" : "Not on WhatsApp"}
-                      </span>
-                    </td>
                   </tr>
                 ))
               )}
