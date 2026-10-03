@@ -15,6 +15,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { API_BASE, COUNTRIES, cn } from "@/lib/utils";
+import { authHeaders, clearToken } from "@/lib/auth";
 
 const TABS = [
   { id: "file", label: "Excel File Filter", icon: FileSpreadsheet },
@@ -39,7 +40,7 @@ function statusView(status) {
   return { label: "Disconnected", dot: "bg-rose-400", tone: "border-rose-500/40 bg-rose-500/10 text-rose-200" };
 }
 
-export default function Dashboard() {
+export default function Dashboard({ onLogout } = {}) {
   const [tab, setTab] = useState("file");
   const [connection, setConnection] = useState("DISCONNECTED");
   const [file, setFile] = useState(null);
@@ -61,7 +62,7 @@ export default function Dashboard() {
 
     async function loadStatus() {
       try {
-        const { data } = await axios.get(`${API_BASE}/api/whatsapp/status`);
+        const { data } = await axios.get(`${API_BASE}/api/whatsapp/status`, { headers: authHeaders() });
         if (active) setConnection(data.status || "DISCONNECTED");
       } catch {
         if (active) setConnection("DISCONNECTED");
@@ -120,7 +121,7 @@ export default function Dashboard() {
     }, 800);
 
     try {
-      const headers = { "x-progress-id": processId, "x-process-id": processId };
+      const headers = { "x-progress-id": processId, "x-process-id": processId, ...authHeaders() };
       let response;
 
       if (tab === "file") {
@@ -156,6 +157,7 @@ export default function Dashboard() {
           try {
             const { data: job } = await axios.get(`${API_BASE}/api/process/progress/${jobId}`, {
               timeout: 60000,
+              headers: authHeaders(),
             });
             if (job?.message || job?.percent != null) {
               setProgress({
@@ -230,7 +232,7 @@ export default function Dashboard() {
   async function controlJob(action) {
     if (!jobId) return;
     try {
-      await axios.post(`${API_BASE}/api/process/control/${jobId}`, { action });
+      await axios.post(`${API_BASE}/api/process/control/${jobId}`, { action }, { headers: authHeaders() });
       if (action === "pause") setPaused(true);
       if (action === "resume") setPaused(false);
       if (action === "stop") {
@@ -253,9 +255,21 @@ export default function Dashboard() {
             <p className="text-sm text-slate-400">Scrape public phone numbers fast. Pause or Stop anytime and download Excel.</p>
           </div>
         </div>
-        <div className={cn("inline-flex items-center gap-2 self-start rounded-full border px-3 py-1.5 text-sm font-medium", badge.tone)}>
-          <span className={cn("h-2.5 w-2.5 rounded-full", badge.dot)} />
-          {badge.label}
+        <div className="flex flex-wrap items-center gap-2 self-start">
+          <div className={cn("inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm font-medium", badge.tone)}>
+            <span className={cn("h-2.5 w-2.5 rounded-full", badge.dot)} />
+            {badge.label}
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              clearToken();
+              onLogout?.();
+            }}
+            className="rounded-full border border-white/15 px-3 py-1.5 text-sm text-slate-300 hover:border-white/30 hover:text-white"
+          >
+            Log out
+          </button>
         </div>
       </header>
 
@@ -424,7 +438,7 @@ export default function Dashboard() {
           <h2 className="text-lg font-semibold">Results preview {stats.scraped > 0 ? `(${stats.scraped} numbers)` : ""}</h2>
           {downloadUrl ? (
             <a
-              href={`${API_BASE}${downloadUrl}`}
+              href={`${API_BASE}${downloadUrl}${downloadUrl.includes("?") ? "&" : "?"}token=${encodeURIComponent((authHeaders().Authorization || "").replace("Bearer ", ""))}`}
               className="inline-flex items-center justify-center gap-2 rounded-2xl bg-[#25D366] px-4 py-2.5 text-sm font-semibold text-[#06210f]"
             >
               <Download className="h-4 w-4" />

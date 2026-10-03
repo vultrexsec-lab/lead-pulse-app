@@ -16,6 +16,8 @@ const apiRoutes = require('./routes');
 const whatsappRoutes = require('./routes/whatsappRoutes');
 const scraperRoutes = require('./routes/scraperRoutes');
 const processRoutes = require('./routes/processRoutes');
+const authRoutes = require('./routes/authRoutes');
+const { requireAuth } = require('./middleware/auth');
 const whatsappService = require('./services/whatsappService');
 try { require('./scripts/patch-baileys-pairing').ensurePatched(); } catch (e) { console.warn('[wa] patch', e.message); }
 
@@ -49,6 +51,12 @@ app.use(cors({
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+app.use('/api/auth', authRoutes);
+// Protect API (except auth + health)
+app.use('/api/process', requireAuth);
+app.use('/api/scraper', requireAuth);
+app.use('/api/whatsapp', requireAuth);
 app.set('upload', upload);
 
 const handleQR = async function (req, res) {
