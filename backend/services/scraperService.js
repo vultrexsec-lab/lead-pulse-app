@@ -272,10 +272,31 @@ function applyCountryCode(number, country) {
 }
 
 function pageName($) {
-  const siteName = cleanText($('meta[property="og:site_name"]').attr('content'));
   const title = cleanText($('title').first().text());
+  // "ΔΗΜΗΤΡΑ Κ ΜΑΡΙΑΓΚΑΚΟΥ | 11888.gr" → person name
+  let titleName = title
+    .replace(/\s*[|\-–—]\s*11888\.gr\s*$/i, '')
+    .replace(/\s*[|\-–—]\s*www\.11888\.gr\s*$/i, '')
+    .trim();
+  if (titleName && /^\d+\.\s*/.test(titleName)) {
+    titleName = titleName.replace(/^\d+\.\s*/, '');
+  }
   const heading = cleanText($('h1').first().text());
-  return siteName || title || heading || 'Unknown';
+  const siteName = cleanText($('meta[property="og:site_name"]').attr('content'));
+  // Prefer real person/business name over site brand
+  if (
+    titleName &&
+    titleName.length > 2 &&
+    !/^11888/i.test(titleName) &&
+    titleName.toLowerCase() !== (siteName || '').toLowerCase()
+  ) {
+    return titleName;
+  }
+  if (heading && heading.length > 2 && !/^11888/i.test(heading) && heading.toLowerCase() !== 'maria') {
+    return heading;
+  }
+  if (titleName && titleName.length > 2) return titleName;
+  return siteName || title || 'Unknown';
 }
 
 function nearbyName($, raw, fallback) {
@@ -349,8 +370,12 @@ function extractLeadsFromHtml(html, pageUrl, defaultCountryCode = null) {
     const number = normalizePhone(raw, defaultCountryCode);
     if (!number || seen.has(number)) return;
     seen.add(number);
+    let finalName = cleanPersonName(name) || cleanPersonName(fallbackName) || cleanText(name).slice(0, 120);
+    if (!finalName || /^11888/i.test(finalName) || finalName.toLowerCase() === 'unknown') {
+      finalName = cleanPersonName(fallbackName) || '';
+    }
     leads.push({
-      name: cleanText(name).slice(0, 120) || fallbackName,
+      name: finalName.slice(0, 120),
       number,
       sourceUrl: pageUrl,
     });
@@ -531,10 +556,59 @@ function isListingPage(html, pageUrl) {
 /**
  * Collect profile detail URLs from a listing HTML.
  */
+function cleanPersonName(value) {
+  let name = cleanText(value);
+  if (!name) return '';
+  // "1. ΔΗΜΗΤΡΑ Κ. ΜΑΡΙΑΓΚΑΚΟΥ" → strip list index
+  name = name.replace(/^\d{1,4}[.)]\s+/, '').trim();
+  name = name.replace(/\s*[|\-–—]\s*11888\.gr\s*$/i, '').trim();
+  if (name.length < 2 || name.length > 120) return '';
+  if (/^11888/i.test(name)) return '';
+  if (/^https?:/i.test(name)) return '';
+  if (/^\d+$/.test(name)) return '';
+  return name;
+}
+
+/**
+ * Returns array of { url, name } for directory profile cards.
+ * Names come from listing card title spans (11888) or link text.
+ */
 function extractProfileLinks(html, pageUrl) {
   const $ = cheerio.load(html || '');
   const origin = new URL(pageUrl);
-  const links = new Set();
+  const byUrl = new Map();
+
+  function add(url, name) {
+    if (!url) return;
+    let normalized = url;
+    try {
+      const u = new URL(url, origin);
+      if (u.origin !== origin.origin) return;
+      u.hash = '';
+      normalized = /\/white-pages\/\d+/i.test(u.pathname)
+        ? u.href.replace(/\/?$/, '/')
+        : u.href;
+    } catch {
+      return;
+    }
+    const prev = byUrl.get(normalized) || { url: normalized, name: '' };
+    const cleaned = cleanPersonName(name);
+    if (cleaned && (!prev.name || cleaned.length > prev.name.length)) {
+      prev.name = cleaned;
+    }
+    byUrl.set(normalized, prev);
+  }
+
+  // 11888 cards: bold name spans near profile links
+  $('span.tw-font-bold, span[class*="font-bold"], strong, h2, h3').each((_, el) => {
+    const name = cleanPersonName($(el).text());
+    if (!name) return;
+    const card = $(el).closest('div, article, li, section');
+    const href =
+      card.find('a[href*="/white-pages/"]').first().attr('href') ||
+      $(el).parent().find('a[href*="/white-pages/"]').first().attr('href');
+    if (href) add(href, name);
+  });
 
   $('a[href]').each((_, el) => {
     const href = $(el).attr('href');
@@ -548,25 +622,30 @@ function extractProfileLinks(html, pageUrl) {
     if (resolved.origin !== origin.origin) return;
     resolved.hash = '';
     const path = resolved.pathname || '';
-    // 11888.gr profiles
     if (/\/white-pages\/\d+\/?$/i.test(path)) {
-      links.add(resolved.href.replace(/\/?$/, '/'));
+      const url = resolved.href.replace(/\/?$/, '/');
+      // name from card
+      const card = $(el).closest('div.tw-flex, article, li, section, div');
+      let name =
+        cleanPersonName(card.find('span.tw-font-bold, span[class*="font-bold"]').first().text()) ||
+        cleanPersonName(card.find('span.tw-text-lg').first().text()) ||
+        cleanPersonName($(el).text());
+      add(url, name);
       return;
     }
-    // generic profile-like paths with numeric or slug id
     if (/\/(profile|person|people|listing|detail|entry)\/[\w-]+\/?$/i.test(path)) {
-      links.add(resolved.href);
+      add(resolved.href, cleanPersonName($(el).text()));
     }
   });
 
-  // Also scan raw HTML for 11888 style ids embedded in JSON
+  // Fallback: raw ids without names
   const re = /\/white-pages\/(\d+)\/?/gi;
   let m;
   while ((m = re.exec(String(html || ''))) !== null) {
-    links.add(`${origin.origin}/white-pages/${m[1]}/`);
+    add(`${origin.origin}/white-pages/${m[1]}/`, '');
   }
 
-  return [...links];
+  return [...byUrl.values()];
 }
 
 /**
@@ -862,20 +941,34 @@ async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCod
     await flushBatch(false);
   }
 
-  async function fetchProfilesPhones(profileUrls) {
-    if (!profileUrls.length) return;
+  async function fetchProfilesPhones(profileItems) {
+    if (!profileItems.length) return;
     await mapPool(
-      profileUrls,
+      profileItems,
       PROFILE_CONCURRENCY,
-      async (profileUrl) => {
+      async (item) => {
         if (control?.isStopped?.()) return null;
         if (control?.waitWhilePaused) await control.waitWhilePaused();
         if (control?.isStopped?.()) return null;
+        const profileUrl = typeof item === 'string' ? item : item.url;
+        const listName = typeof item === 'string' ? '' : item.name || '';
         try {
           if (REQUEST_DELAY_MS > 0) await sleep(REQUEST_DELAY_MS);
           const html = await fetchWithAxios(profileUrl).catch(() => null);
           if (!html) return null;
-          addLive(extractLeadsFromHtml(html, profileUrl, defaultCountryCode));
+          const leads = extractLeadsFromHtml(html, profileUrl, defaultCountryCode).map((lead) => {
+            const pageTitleName = cleanPersonName(
+              String(html).match(/<title[^>]*>([^<]+)<\/title>/i)?.[1] || ''
+            );
+            const bestName =
+              cleanPersonName(lead.name) &&
+              !/^11888/i.test(lead.name) &&
+              lead.name.toLowerCase() !== 'unknown'
+                ? lead.name
+                : listName || pageTitleName || lead.name;
+            return { ...lead, name: bestName || lead.name || '' };
+          });
+          addLive(leads);
         } catch (err) {
           console.warn(`[scraper] profile ${profileUrl}: ${err.message}`);
         }
@@ -923,11 +1016,13 @@ async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCod
       addLive(extractLeadsFromHtml(html, pageUrl, defaultCountryCode));
 
       const pageProfiles = [];
-      for (const link of extractProfileLinks(html, pageUrl)) {
-        if (profileSeen.has(link)) continue;
+      for (const item of extractProfileLinks(html, pageUrl)) {
+        const link = typeof item === 'string' ? item : item.url;
+        const listName = typeof item === 'string' ? '' : item.name || '';
+        if (!link || profileSeen.has(link)) continue;
         if (profileSeen.size >= MAX_PROFILE_PAGES) break;
         profileSeen.add(link);
-        pageProfiles.push(link);
+        pageProfiles.push({ url: link, name: listName });
       }
 
       pagesDone += 1;
@@ -936,7 +1031,6 @@ async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCod
         false
       );
 
-      // Fetch this page's profiles NOW so Stop always has real numbers
       if (pageProfiles.length) {
         await fetchProfilesPhones(pageProfiles);
         await reportLive(
