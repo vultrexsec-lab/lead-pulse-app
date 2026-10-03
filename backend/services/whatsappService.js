@@ -34,9 +34,9 @@ let intentionalClose = false;
 const logger = pino({ level: process.env.WA_LOG_LEVEL || 'silent' });
 
 function isWhatsAppEnabled() {
-  // ON by default. Set WHATSAPP_ENABLED=0 to disable.
-  const v = String(process.env.WHATSAPP_ENABLED || '1').toLowerCase();
-  return v !== '0' && v !== 'false' && v !== 'off';
+  // OFF by default — QR linking unreliable on cloud. Set WHATSAPP_ENABLED=1 to enable.
+  const v = String(process.env.WHATSAPP_ENABLED || '0').toLowerCase();
+  return v === '1' || v === 'true' || v === 'on';
 }
 
 function isRenderLike() {

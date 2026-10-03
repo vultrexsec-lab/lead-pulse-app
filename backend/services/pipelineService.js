@@ -417,7 +417,8 @@ function summarize(rows, file, duplicatesRemoved) {
     downloadUrl: file.downloadUrl,
     filePath: file.filePath,
     total: rows.length,
-    whatsappCount: rows.filter((row) => row.isWhatsApp).length,
+    whatsappCount: rows.filter((row) => row.isWhatsApp === true).length,
+    namedCount: rows.filter((row) => row.name).length,
     duplicatesRemoved,
     leads: rows.map((row) => ({
       name: row.name,

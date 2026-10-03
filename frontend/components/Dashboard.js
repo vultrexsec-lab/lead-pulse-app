@@ -200,8 +200,8 @@ export default function Dashboard() {
       const duplicates = data.duplicatesRemoved || 0;
       setStats({
         scraped: total,
-        valid,
-        invalid: Math.max(total - valid, 0),
+        valid: data.namedCount || list.filter((l) => l.name).length || 0,
+        invalid: total,
         duplicates,
       });
       setLeads(list);
@@ -250,7 +250,7 @@ export default function Dashboard() {
           </span>
           <div>
             <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">Lead Pulse - WhatsApp Extractor</h1>
-            <p className="text-sm text-slate-400">Find public leads, skip numbers you already scanned, and keep the WhatsApp matches.</p>
+            <p className="text-sm text-slate-400">Scrape public phone numbers fast. Pause or Stop anytime and download Excel.</p>
           </div>
         </div>
         <div className={cn("inline-flex items-center gap-2 self-start rounded-full border px-3 py-1.5 text-sm font-medium", badge.tone)}>
@@ -362,7 +362,7 @@ export default function Dashboard() {
           className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-[#25D366] px-5 py-3 font-semibold text-[#06210f] transition hover:bg-[#1ebe5d] disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-slate-500"
         >
           {running ? <Loader2 className="h-5 w-5 animate-spin" /> : <Search className="h-5 w-5" />}
-          Start Extraction & WhatsApp Verification
+          Start Extraction
         </button>
 
         {running && (
@@ -414,8 +414,8 @@ export default function Dashboard() {
 
       <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard label="Total Scraped" value={stats.scraped} icon={Globe} />
-        <StatCard label="Valid WhatsApp (Active)" value={stats.valid} icon={CheckCircle2} tone="text-[#25D366]" />
-        <StatCard label="Invalid / Non-WA" value={stats.invalid} icon={XCircle} tone="text-rose-300" />
+        <StatCard label="With Name" value={stats.valid} icon={CheckCircle2} tone="text-[#25D366]" />
+        <StatCard label="Numbers Found" value={stats.scraped} icon={XCircle} tone="text-rose-300" />
         <StatCard label="Duplicates Removed (Filtered Out)" value={stats.duplicates} icon={Filter} tone="text-amber-200" />
       </section>
 

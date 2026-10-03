@@ -53,11 +53,11 @@ app.set('upload', upload);
 
 const handleQR = async function (req, res) {
   try {
-    const waOff = ['0', 'false', 'off'].includes(String(process.env.WHATSAPP_ENABLED || '1').toLowerCase());
-    if (waOff) {
+    const waOn = ['1', 'true', 'on'].includes(String(process.env.WHATSAPP_ENABLED || '0').toLowerCase());
+    if (!waOn) {
       return res.status(200).json({
         status: 'disabled',
-        message: 'WhatsApp OFF (WHATSAPP_ENABLED=0).',
+        message: 'WhatsApp OFF — numbers scrape only.',
       });
     }
     if (typeof whatsappService.connectWhatsApp === 'function') {

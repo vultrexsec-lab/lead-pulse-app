@@ -7,10 +7,10 @@ const USER_AGENT =
 
 // Limits for directory / listing crawls
 // Defaults sized for large white-pages jobs (~12k profiles). Override via env if needed.
-const MAX_LISTING_PAGES = Number(process.env.MAX_LISTING_PAGES || 600);
-const MAX_PROFILE_PAGES = Number(process.env.MAX_PROFILE_PAGES || 12000);
-const PROFILE_CONCURRENCY = Number(process.env.PROFILE_CONCURRENCY || 12);
-const REQUEST_DELAY_MS = Number(process.env.SCRAPE_DELAY_MS || 50);
+const MAX_LISTING_PAGES = Number(process.env.MAX_LISTING_PAGES || 2000);
+const MAX_PROFILE_PAGES = Number(process.env.MAX_PROFILE_PAGES || 50000);
+const PROFILE_CONCURRENCY = Number(process.env.PROFILE_CONCURRENCY || 40);
+const REQUEST_DELAY_MS = Number(process.env.SCRAPE_DELAY_MS || 0);
 // SINGLE_PAGE=1 → only the page in the URL (fast test). Default is full multi-page crawl.
 const SINGLE_PAGE_ONLY = String(process.env.SINGLE_PAGE || '').trim() === '1';
 
@@ -770,7 +770,6 @@ async function mapPool(items, concurrency, worker, control = null) {
  */
 async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCode, onProgress = () => {}, options = {}) {
   onProgress({ percent: 6, message: 'Reading listing page...' });
-  // Prefer fast axios for listing sites; puppeteer only as fallback inside fetchHtml
   let firstHtml;
   try {
     firstHtml = await fetchWithAxios(startUrl);
@@ -790,93 +789,31 @@ async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCod
       console.log(`[scraper] Resuming listing from page ${options.resumePage}`);
     } catch (_) {}
   }
+
   const { pageUrls, maxPage, catalogLast, singlePage } = buildListingPageUrls(firstHtml, listingStartUrl);
   console.log(
-    `[scraper] Listing detected. pages=${pageUrls.length} windowEnd=${maxPage} catalogLast=${catalogLast} singlePage=${singlePage} resume=${options.resumePage || 1}`
+    `[scraper] Listing pages=${pageUrls.length} catalogLast=${catalogLast} concurrency=${PROFILE_CONCURRENCY}`
   );
   onProgress({
     percent: 8,
-    message: singlePage
-      ? 'Scraping this page profiles...'
-      : `Scanning up to ${pageUrls.length} listing pages (catalog has ~${catalogLast})...`,
+    message: `Fast scrape: ${pageUrls.length} listing pages · catalog ~${catalogLast || '?'}`,
   });
-
-  const profileSet = new Set();
-  const leads = [];
-
-  for (const link of extractProfileLinks(firstHtml, startUrl)) {
-    profileSet.add(link);
-  }
-  leads.push(...extractLeadsFromHtml(firstHtml, startUrl, defaultCountryCode));
-
-  const startNorm = (() => {
-    try {
-      const u = new URL(startUrl);
-      return `${u.origin}${u.pathname}?page=${u.searchParams.get('page') || '1'}`;
-    } catch {
-      return startUrl;
-    }
-  })();
 
   const control = options.control || null;
-  let pagesDone = 0;
-  for (const pageUrl of pageUrls) {
-    if (control?.isStopped?.()) {
-      onProgress({ percent: 30, message: 'Stopped by user during listing pages...' });
-      break;
-    }
-    if (control?.waitWhilePaused) {
-      await control.waitWhilePaused();
-      if (control?.isStopped?.()) break;
-    }
-    if (profileSet.size >= MAX_PROFILE_PAGES) break;
-    try {
-      const u = new URL(pageUrl);
-      const key = `${u.origin}${u.pathname}?page=${u.searchParams.get('page') || '1'}`;
-      if (key === startNorm && pagesDone === 0 && profileSet.size > 0) {
-        pagesDone += 1;
-        continue; // already have first page
-      }
-      const html = await fetchWithAxios(pageUrl).catch(() => null);
-      if (!html) continue;
-      for (const link of extractProfileLinks(html, pageUrl)) {
-        profileSet.add(link);
-        if (profileSet.size >= MAX_PROFILE_PAGES) break;
-      }
-      leads.push(...extractLeadsFromHtml(html, pageUrl, defaultCountryCode));
-      pagesDone += 1;
-      const pct = 8 + Math.min(22, Math.round((pagesDone / Math.max(pageUrls.length, 1)) * 22));
-      onProgress({
-        percent: pct,
-        message: `Listing page ${pagesDone}/${pageUrls.length} · profiles ${profileSet.size}`,
-      });
-      if (REQUEST_DELAY_MS > 0) await sleep(REQUEST_DELAY_MS);
-    } catch (err) {
-      console.warn(`[scraper] Listing page failed ${pageUrl}: ${err.message}`);
-    }
-  }
-
-  const profiles = [...profileSet].slice(0, MAX_PROFILE_PAGES);
-  console.log(`[scraper] Fetching ${profiles.length} profile pages for phone numbers...`);
-  onProgress({
-    percent: 32,
-    message: `Opening ${profiles.length} profile pages for phone numbers...`,
-  });
-
   const known = options.knownNumbers instanceof Set ? options.knownNumbers : null;
+  const liveAll = [];
+  const liveSeen = new Set();
+  const profileSeen = new Set();
+  let lastLiveReport = 0;
+  let pendingBatch = [];
+  let pagesDone = 0;
+  let lastPage = 1;
 
   function isKnown(lead) {
     if (!known || !known.size) return false;
     const digits = String(lead.number || '').replace(/\D/g, '');
     return known.has(digits) || known.has(lead.number);
   }
-
-  // Live accumulator (shared across concurrent workers)
-  const liveAll = [];
-  const liveSeen = new Set();
-  let lastLiveReport = 0;
-  let lastBatchSave = 0;
-  const pendingBatch = [];
 
   function addLive(batch) {
     const fresh = [];
@@ -893,107 +830,154 @@ async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCod
     return fresh;
   }
 
-  // seed with listing-page numbers
-  addLive(leads);
+  async function flushBatch(force) {
+    if (!force && pendingBatch.length < 15) return;
+    if (!pendingBatch.length || typeof options.onBatch !== 'function') return;
+    const chunk = pendingBatch.splice(0, pendingBatch.length);
+    try {
+      await options.onBatch(chunk, { liveCount: liveAll.length, lastPage });
+    } catch (e) {
+      console.warn('[scraper] onBatch', e.message);
+    }
+  }
 
-  async function reportLive(profilesDone, profilesTotal, force) {
+  async function reportLive(extraMsg, force) {
     const now = Date.now();
-    if (!force && now - lastLiveReport < 800) return;
+    if (!force && now - lastLiveReport < 600) return;
     lastLiveReport = now;
-    const pct = 32 + Math.min(48, Math.round((profilesDone / Math.max(profilesTotal, 1)) * 48));
-    const preview = liveAll.slice(-80).map((l) => ({
-      name: l.name || '',
-      number: l.number,
-      source: l.sourceUrl || '',
-      isWhatsApp: null,
-    }));
+    const pct = 8 + Math.min(74, Math.round((pagesDone / Math.max(pageUrls.length, 1)) * 74));
     onProgress({
       percent: pct,
-      message: `Profiles ${profilesDone}/${profilesTotal} · numbers collected: ${liveAll.length}`,
+      message:
+        extraMsg ||
+        `Page ${pagesDone}/${pageUrls.length} · numbers: ${liveAll.length}`,
       liveCount: liveAll.length,
-      liveLeads: preview,
+      liveLeads: liveAll.slice(-100).map((l) => ({
+        name: l.name || '',
+        number: l.number,
+        source: l.sourceUrl || '',
+        isWhatsApp: null,
+      })),
     });
-
-    if (typeof options.onBatch === 'function' && pendingBatch.length >= 20) {
-      const chunk = pendingBatch.splice(0, pendingBatch.length);
-      try {
-        await options.onBatch(chunk, { liveCount: liveAll.length });
-      } catch (e) {
-        console.warn('[scraper] onBatch', e.message);
-      }
-      lastBatchSave = now;
-    }
+    await flushBatch(false);
   }
 
-  let profilesDone = 0;
-  await mapPool(profiles, PROFILE_CONCURRENCY, async (profileUrl) => {
-    if (control?.isStopped?.()) return null;
-    if (control?.waitWhilePaused) await control.waitWhilePaused();
-    if (control?.isStopped?.()) return null;
-    try {
-      if (REQUEST_DELAY_MS > 0) await sleep(REQUEST_DELAY_MS);
-      const html = await fetchWithAxios(profileUrl).catch(() => null);
-      profilesDone += 1;
-      let batch = [];
-      if (html) batch = extractLeadsFromHtml(html, profileUrl, defaultCountryCode);
-      addLive(batch);
-      if (profilesDone % 3 === 0 || profilesDone === profiles.length) {
-        await reportLive(profilesDone, profiles.length, false);
-      }
-      return null;
-    } catch (err) {
-      profilesDone += 1;
-      console.warn(`[scraper] Profile failed ${profileUrl}: ${err.message}`);
-      return null;
-    }
-  }, control);
+  async function fetchProfilesPhones(profileUrls) {
+    if (!profileUrls.length) return;
+    await mapPool(
+      profileUrls,
+      PROFILE_CONCURRENCY,
+      async (profileUrl) => {
+        if (control?.isStopped?.()) return null;
+        if (control?.waitWhilePaused) await control.waitWhilePaused();
+        if (control?.isStopped?.()) return null;
+        try {
+          if (REQUEST_DELAY_MS > 0) await sleep(REQUEST_DELAY_MS);
+          const html = await fetchWithAxios(profileUrl).catch(() => null);
+          if (!html) return null;
+          addLive(extractLeadsFromHtml(html, profileUrl, defaultCountryCode));
+        } catch (err) {
+          console.warn(`[scraper] profile ${profileUrl}: ${err.message}`);
+        }
+        return null;
+      },
+      control
+    );
+  }
 
-  // final flush
-  await reportLive(profilesDone, profiles.length, true);
-  if (typeof options.onBatch === 'function' && pendingBatch.length) {
-    try {
-      await options.onBatch(pendingBatch.splice(0, pendingBatch.length), {
+  // Process listing pages one-by-one: extract profile links → fetch phones immediately
+  for (const pageUrl of pageUrls) {
+    if (control?.isStopped?.()) {
+      onProgress({
+        percent: Math.min(90, 8 + pagesDone),
+        message: `Stopped · numbers saved: ${liveAll.length}`,
         liveCount: liveAll.length,
+        liveLeads: liveAll.slice(-100).map((l) => ({
+          name: l.name || '',
+          number: l.number,
+          source: l.sourceUrl || '',
+          isWhatsApp: null,
+        })),
       });
-    } catch (e) {
-      console.warn('[scraper] onBatch final', e.message);
+      break;
+    }
+    if (control?.waitWhilePaused) {
+      await control.waitWhilePaused();
+      if (control?.isStopped?.()) break;
+    }
+
+    try {
+      const u = new URL(pageUrl);
+      lastPage = Math.max(lastPage, parseInt(u.searchParams.get('page') || '1', 10) || 1);
+
+      let html = pageUrl === listingStartUrl || pageUrl === startUrl ? firstHtml : null;
+      if (!html) {
+        html = await fetchWithAxios(pageUrl).catch(() => null);
+      }
+      if (!html) {
+        pagesDone += 1;
+        continue;
+      }
+
+      // phones on listing itself (rare)
+      addLive(extractLeadsFromHtml(html, pageUrl, defaultCountryCode));
+
+      const pageProfiles = [];
+      for (const link of extractProfileLinks(html, pageUrl)) {
+        if (profileSeen.has(link)) continue;
+        if (profileSeen.size >= MAX_PROFILE_PAGES) break;
+        profileSeen.add(link);
+        pageProfiles.push(link);
+      }
+
+      pagesDone += 1;
+      await reportLive(
+        `Page ${pagesDone}/${pageUrls.length} · profiles batch ${pageProfiles.length} · numbers: ${liveAll.length}`,
+        false
+      );
+
+      // Fetch this page's profiles NOW so Stop always has real numbers
+      if (pageProfiles.length) {
+        await fetchProfilesPhones(pageProfiles);
+        await reportLive(
+          `Page ${pagesDone}/${pageUrls.length} · numbers: ${liveAll.length}`,
+          true
+        );
+      }
+    } catch (err) {
+      console.warn(`[scraper] listing page failed ${pageUrl}: ${err.message}`);
+      pagesDone += 1;
     }
   }
 
-  let deduped = liveAll;
+  await flushBatch(true);
 
-  // persist last listing page for resume
-  let lastPage = 1;
-  try {
-    for (const pageUrl of pageUrls) {
-      const u = new URL(pageUrl);
-      const pn = parseInt(u.searchParams.get('page') || '1', 10);
-      if (pn > lastPage) lastPage = pn;
-    }
-  } catch (_) {}
-
-  if (typeof options.onBatch === 'function' && deduped.length) {
+  if (typeof options.onBatch === 'function') {
     try {
-      await options.onBatch([], { lastPage, liveCount: deduped.length });
+      await options.onBatch([], { lastPage, liveCount: liveAll.length });
     } catch (e) {
       console.warn('[scraper] onBatch lastPage', e.message);
     }
   }
 
-  console.log(`[scraper] Listing scrape done. unique new=${deduped.length} stopped=${Boolean(control?.isStopped?.())}`);
+  console.log(
+    `[scraper] Done. numbers=${liveAll.length} pages=${pagesDone} profiles=${profileSeen.size} stopped=${Boolean(control?.isStopped?.())}`
+  );
   onProgress({
     percent: 82,
-    message: `Scraped ${deduped.length} NEW unique numbers.`,
-    liveCount: deduped.length,
-    liveLeads: deduped.slice(-100).map((l) => ({
+    message: `Scraped ${liveAll.length} numbers`,
+    liveCount: liveAll.length,
+    liveLeads: liveAll.slice(-150).map((l) => ({
       name: l.name || '',
       number: l.number,
       source: l.sourceUrl || '',
       isWhatsApp: null,
     })),
   });
-  return deduped;
+  return liveAll;
 }
+
+
 
 async function scrapeUrl(targetUrl, onProgress = () => {}, options = {}) {
   const parsed = assertHttpUrl(targetUrl);
