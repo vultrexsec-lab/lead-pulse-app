@@ -436,14 +436,16 @@ async function processUrlScrape(url, onProgress = () => {}, control = null) {
     resumePage,
     control,
     onBatch: async (batch, meta) => {
-      await saveLeadsToDatabase(
-        batch.map((lead) => ({
-          name: lead.name,
-          number: lead.number,
-          source: lead.sourceUrl || url,
-          isWhatsApp: null,
-        }))
-      );
+      if (batch && batch.length) {
+        await saveLeadsToDatabase(
+          batch.map((lead) => ({
+            name: lead.name,
+            number: lead.number,
+            source: lead.sourceUrl || url,
+            isWhatsApp: null,
+          }))
+        );
+      }
       if (meta && meta.lastPage) {
         progressStore[key] = {
           ...(progressStore[key] || {}),
@@ -452,6 +454,12 @@ async function processUrlScrape(url, onProgress = () => {}, control = null) {
           url,
         };
         writeUrlProgress(progressStore);
+      }
+      if (meta && meta.liveCount != null) {
+        onProgress({
+          message: `Numbers collected so far: ${meta.liveCount}`,
+          liveCount: meta.liveCount,
+        });
       }
     },
   });

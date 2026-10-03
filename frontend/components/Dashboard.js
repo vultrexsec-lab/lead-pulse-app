@@ -157,7 +157,18 @@ export default function Dashboard() {
             const { data: job } = await axios.get(`${API_BASE}/api/process/progress/${jobId}`, {
               timeout: 60000,
             });
-            if (job?.message) setProgress({ percent: job.percent || 0, message: job.message });
+            if (job?.message || job?.percent != null) {
+              setProgress({
+                percent: job.percent != null ? job.percent : 0,
+                message: job.message || "Working...",
+              });
+            }
+            if (typeof job?.liveCount === "number") {
+              setStats((s) => ({ ...s, scraped: job.liveCount }));
+            }
+            if (Array.isArray(job?.liveLeads) && job.liveLeads.length) {
+              setLeads(job.liveLeads);
+            }
             if (job?.done) {
               if (job.error || job.result?.success === false) {
                 throw new Error(job.result?.message || job.message || "Extraction failed");
@@ -346,6 +357,38 @@ export default function Dashboard() {
           Start Extraction & WhatsApp Verification
         </button>
 
+        {running && (
+          <div className="mt-3 flex flex-wrap gap-2">
+            {!paused ? (
+              <button
+                type="button"
+                onClick={() => controlJob("pause")}
+                className="rounded-xl border border-amber-400/40 bg-amber-400/10 px-4 py-2 text-sm font-medium text-amber-200 hover:bg-amber-400/20"
+              >
+                Pause
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => controlJob("resume")}
+                className="rounded-xl border border-emerald-400/40 bg-emerald-400/10 px-4 py-2 text-sm font-medium text-emerald-200 hover:bg-emerald-400/20"
+              >
+                Resume
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => controlJob("stop")}
+              className="rounded-xl border border-rose-400/40 bg-rose-500/10 px-4 py-2 text-sm font-medium text-rose-200 hover:bg-rose-500/20"
+            >
+              Stop & Save
+            </button>
+            <span className="self-center text-xs text-slate-400">
+              Live numbers appear below · Stop anytime to download
+            </span>
+          </div>
+        )}
+
         <div className="mt-5">
           <div className="mb-2 flex items-center justify-between text-sm text-slate-300">
             <span>{progress.message}</span>
@@ -370,7 +413,7 @@ export default function Dashboard() {
 
       <section className="rounded-3xl border border-white/10 bg-[#0d141c] p-4 sm:p-5">
         <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <h2 className="text-lg font-semibold">Results preview</h2>
+          <h2 className="text-lg font-semibold">Results preview {stats.scraped > 0 ? `(${stats.scraped} numbers)` : ""}</h2>
           {downloadUrl ? (
             <a
               href={`${API_BASE}${downloadUrl}`}

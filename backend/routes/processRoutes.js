@@ -43,13 +43,23 @@ function trackProgress(req) {
 
   const report = (update) => {
     const prev = jobs.get(id) || { control: { paused: false, stopped: false } };
-    jobs.set(id, {
+    const next = {
       ...prev,
       ...update,
       jobId: id,
       control: prev.control || { paused: false, stopped: false },
       updatedAt: Date.now(),
-    });
+    };
+    if (update.percent === undefined || update.percent === null) {
+      next.percent = prev.percent;
+    }
+    if (update.message === undefined) {
+      next.message = prev.message;
+    }
+    // keep latest liveLeads/liveCount from update or prev
+    if (update.liveLeads === undefined && prev.liveLeads) next.liveLeads = prev.liveLeads;
+    if (update.liveCount === undefined && prev.liveCount != null) next.liveCount = prev.liveCount;
+    jobs.set(id, next);
   };
 
   const controlApi = {

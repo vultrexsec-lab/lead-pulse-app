@@ -863,68 +863,134 @@ async function scrapeListingDirectory(startUrl, browserHolder, defaultCountryCod
     message: `Opening ${profiles.length} profile pages for phone numbers...`,
   });
 
+  const known = options.knownNumbers instanceof Set ? options.knownNumbers : null;
+
+  function isKnown(lead) {
+    if (!known || !known.size) return false;
+    const digits = String(lead.number || '').replace(/\D/g, '');
+    return known.has(digits) || known.has(lead.number);
+  }
+
+  // Live accumulator (shared across concurrent workers)
+  const liveAll = [];
+  const liveSeen = new Set();
+  let lastLiveReport = 0;
+  let lastBatchSave = 0;
+  const pendingBatch = [];
+
+  function addLive(batch) {
+    const fresh = [];
+    for (const lead of batch || []) {
+      if (!lead || !lead.number) continue;
+      if (isKnown(lead)) continue;
+      const key = String(lead.number).replace(/\D/g, '') || lead.number;
+      if (liveSeen.has(key)) continue;
+      liveSeen.add(key);
+      liveAll.push(lead);
+      fresh.push(lead);
+      pendingBatch.push(lead);
+    }
+    return fresh;
+  }
+
+  // seed with listing-page numbers
+  addLive(leads);
+
+  async function reportLive(profilesDone, profilesTotal, force) {
+    const now = Date.now();
+    if (!force && now - lastLiveReport < 800) return;
+    lastLiveReport = now;
+    const pct = 32 + Math.min(48, Math.round((profilesDone / Math.max(profilesTotal, 1)) * 48));
+    const preview = liveAll.slice(-80).map((l) => ({
+      name: l.name || '',
+      number: l.number,
+      source: l.sourceUrl || '',
+      isWhatsApp: null,
+    }));
+    onProgress({
+      percent: pct,
+      message: `Profiles ${profilesDone}/${profilesTotal} · numbers collected: ${liveAll.length}`,
+      liveCount: liveAll.length,
+      liveLeads: preview,
+    });
+
+    if (typeof options.onBatch === 'function' && pendingBatch.length >= 20) {
+      const chunk = pendingBatch.splice(0, pendingBatch.length);
+      try {
+        await options.onBatch(chunk, { liveCount: liveAll.length });
+      } catch (e) {
+        console.warn('[scraper] onBatch', e.message);
+      }
+      lastBatchSave = now;
+    }
+  }
+
   let profilesDone = 0;
-  const profileLeads = await mapPool(profiles, PROFILE_CONCURRENCY, async (profileUrl) => {
-    if (control?.isStopped?.()) return [];
+  await mapPool(profiles, PROFILE_CONCURRENCY, async (profileUrl) => {
+    if (control?.isStopped?.()) return null;
     if (control?.waitWhilePaused) await control.waitWhilePaused();
-    if (control?.isStopped?.()) return [];
+    if (control?.isStopped?.()) return null;
     try {
       if (REQUEST_DELAY_MS > 0) await sleep(REQUEST_DELAY_MS);
       const html = await fetchWithAxios(profileUrl).catch(() => null);
       profilesDone += 1;
-      if (profilesDone % 5 === 0 || profilesDone === profiles.length) {
-        const pct = 32 + Math.min(48, Math.round((profilesDone / Math.max(profiles.length, 1)) * 48));
-        onProgress({
-          percent: pct,
-          message: `Profiles ${profilesDone}/${profiles.length} · numbers so far updating...`,
-        });
+      let batch = [];
+      if (html) batch = extractLeadsFromHtml(html, profileUrl, defaultCountryCode);
+      addLive(batch);
+      if (profilesDone % 3 === 0 || profilesDone === profiles.length) {
+        await reportLive(profilesDone, profiles.length, false);
       }
-      if (!html) return [];
-      return extractLeadsFromHtml(html, profileUrl, defaultCountryCode);
+      return null;
     } catch (err) {
       profilesDone += 1;
       console.warn(`[scraper] Profile failed ${profileUrl}: ${err.message}`);
-      return [];
+      return null;
     }
   }, control);
 
-  for (const batch of profileLeads) {
-    if (Array.isArray(batch)) leads.push(...batch);
+  // final flush
+  await reportLive(profilesDone, profiles.length, true);
+  if (typeof options.onBatch === 'function' && pendingBatch.length) {
+    try {
+      await options.onBatch(pendingBatch.splice(0, pendingBatch.length), {
+        liveCount: liveAll.length,
+      });
+    } catch (e) {
+      console.warn('[scraper] onBatch final', e.message);
+    }
   }
 
-  let deduped = dedupeLeads(leads);
-  const known = options.knownNumbers instanceof Set ? options.knownNumbers : null;
-  if (known && known.size) {
-    const before = deduped.length;
-    deduped = deduped.filter((lead) => {
-      const digits = String(lead.number || '').replace(/\D/g, '');
-      return !known.has(digits) && !known.has(lead.number);
-    });
-    console.log(`[scraper] Filtered known numbers: ${before} → ${deduped.length} new`);
-  }
+  let deduped = liveAll;
 
   // persist last listing page for resume
   let lastPage = 1;
   try {
     for (const pageUrl of pageUrls) {
       const u = new URL(pageUrl);
-      const p = parseInt(u.searchParams.get('page') || '1', 10);
-      if (p > lastPage) lastPage = p;
+      const pn = parseInt(u.searchParams.get('page') || '1', 10);
+      if (pn > lastPage) lastPage = pn;
     }
   } catch (_) {}
 
   if (typeof options.onBatch === 'function' && deduped.length) {
     try {
-      await options.onBatch(deduped, { lastPage });
+      await options.onBatch([], { lastPage, liveCount: deduped.length });
     } catch (e) {
-      console.warn('[scraper] onBatch failed', e.message);
+      console.warn('[scraper] onBatch lastPage', e.message);
     }
   }
 
-  console.log(`[scraper] Listing scrape done. Raw=${leads.length} unique new=${deduped.length}`);
+  console.log(`[scraper] Listing scrape done. unique new=${deduped.length} stopped=${Boolean(control?.isStopped?.())}`);
   onProgress({
     percent: 82,
     message: `Scraped ${deduped.length} NEW unique numbers.`,
+    liveCount: deduped.length,
+    liveLeads: deduped.slice(-100).map((l) => ({
+      name: l.name || '',
+      number: l.number,
+      source: l.sourceUrl || '',
+      isWhatsApp: null,
+    })),
   });
   return deduped;
 }
